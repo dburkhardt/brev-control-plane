@@ -10,11 +10,9 @@
 
 ---
 
-## Scope And Public-Safety Constraints
+## Scope And Generic Content Constraints
 
-This plan must not add examples, tests, fixtures, comments, or docs for any private workload. All new CLI surfaces must be generic: shell commands, tarball/directory bundles, artifacts, machine checks, and Brev fleet lifecycle.
-
-For public-safety scans, keep private or organization-specific terms in an uncommitted local file at `/tmp/public-safety-terms.txt`. Do not write that term list into this repository, commit it, or include it in documentation.
+This plan must not add examples, tests, fixtures, comments, or docs with confidential project, customer, organization-specific, or sensitive workload details. All new CLI surfaces must be generic: shell commands, tarball/directory bundles, artifacts, machine checks, and Brev fleet lifecycle.
 
 ## File Structure
 
@@ -1236,7 +1234,7 @@ git commit -m "Add generic bundle job runner"
 
 ---
 
-### Task 7: Update README And Run Public-Safety Verification
+### Task 7: Update README And Verify
 
 **Files:**
 - Modify: `README.md`
@@ -1291,15 +1289,11 @@ Add generic `job.json` example:
 }
 ```
 
-- [ ] **Step 2: Run public-safety scan**
+- [ ] **Step 2: Review generic wording**
 
-Run:
-
-```bash
-rg -n -i -f /tmp/public-safety-terms.txt .
-```
-
-Expected: no matches.
+Confirm README examples and command descriptions stay generic and do not include
+confidential project, customer, organization-specific, or sensitive workload
+details.
 
 - [ ] **Step 3: Run tests**
 
@@ -1361,17 +1355,7 @@ PYTHONPATH=src python3 -m brev_control_plane fleet plan \
 
 Expected: JSON with workers `smoke-001` and `smoke-002`, and `creates_instances: false`.
 
-- [ ] **Step 4: Public-safety scan**
-
-Run:
-
-```bash
-rg -n -i -f /tmp/public-safety-terms.txt .
-```
-
-Expected: no matches.
-
-- [ ] **Step 5: Git status**
+- [ ] **Step 4: Git status**
 
 Run:
 

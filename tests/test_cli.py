@@ -13,10 +13,15 @@ class FakeBrevClient:
         self.exec_calls = []
         self.exec_outputs = {}
         self.instances = [{"id": "inst-1", "name": "worker", "status": "running"}]
+        self.list_results = None
         self.org = "personal"
 
     def list_instances(self):
         self.refreshed = True
+        if self.list_results is not None:
+            if len(self.list_results) > 1:
+                return self.list_results.pop(0)
+            return self.list_results[0]
         return self.instances
 
     def search_cpu(self):
@@ -301,7 +306,7 @@ def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():
     ]
 
     code = main(
-        ["fleet", "down", "--name-prefix", "smoke", "--yes"],
+        ["fleet", "down", "--name-prefix", "smoke", "--yes", "--no-wait"],
         stdout=stdout,
         client=client,
     )
@@ -310,6 +315,71 @@ def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():
     assert client.deleted == ["smoke-001", "smoke-002"]
     payload = json.loads(stdout.getvalue())
     assert payload["deleted"] == ["smoke-001", "smoke-002"]
+    assert payload["remaining"] == []
+
+
+def test_cli_fleet_down_waits_until_matching_instances_are_gone():
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.list_results = [
+        [
+            {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+            {"id": "inst-2", "name": "smoke-002", "status": "RUNNING"},
+        ],
+        [{"id": "inst-2", "name": "smoke-002", "status": "DELETING"}],
+        [],
+    ]
+
+    code = main(
+        [
+            "fleet",
+            "down",
+            "--name-prefix",
+            "smoke",
+            "--yes",
+            "--timeout-seconds",
+            "1",
+            "--poll-seconds",
+            "0",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert client.deleted == ["smoke-001", "smoke-002"]
+    payload = json.loads(stdout.getvalue())
+    assert payload["deleted"] == ["smoke-001", "smoke-002"]
+    assert payload["remaining"] == []
+
+
+def test_cli_fleet_down_returns_two_when_wait_times_out():
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.list_results = [
+        [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}],
+        [{"id": "inst-1", "name": "smoke-001", "status": "DELETING"}],
+    ]
+
+    code = main(
+        [
+            "fleet",
+            "down",
+            "--name-prefix",
+            "smoke",
+            "--yes",
+            "--timeout-seconds",
+            "0",
+            "--poll-seconds",
+            "0",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    payload = json.loads(stdout.getvalue())
+    assert payload["remaining"] == ["smoke-001"]
 
 
 def test_cli_inventory_refresh_uses_injected_brev_client(tmp_path):

@@ -6,6 +6,7 @@ from pathlib import Path
 import shlex
 import shutil
 import sys
+import time
 from typing import Any, TextIO
 
 from .brev import BrevClient, BrevCommandError
@@ -63,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete fleet instances matching a name prefix.",
     )
     fleet_down.add_argument("--name-prefix", required=True)
+    fleet_down.add_argument("--require-org")
+    fleet_down.add_argument("--timeout-seconds", type=float, default=900.0)
+    fleet_down.add_argument("--poll-seconds", type=float, default=10.0)
+    fleet_down.add_argument("--no-wait", action="store_true")
     fleet_down.add_argument("--yes", action="store_true")
 
     inventory = subparsers.add_parser("inventory", help="Manage local inventory state.")
@@ -241,11 +246,24 @@ def _fleet_down(
 ) -> int:
     if not args.yes:
         raise PlanError("fleet down deletes instances and requires --yes")
+    if args.timeout_seconds < 0:
+        raise PlanError("timeout_seconds must be non-negative")
+    if args.poll_seconds < 0:
+        raise PlanError("poll_seconds must be non-negative")
     brev_client = client or BrevClient()
+    _require_active_org(brev_client, args.require_org)
     names = _matching_instance_names(brev_client, args.name_prefix)
     outputs = {name: brev_client.delete_instance(name) for name in names}
-    _write_json(stdout, {"deleted": names, "outputs": outputs})
-    return 0
+    remaining: list[str] = []
+    if not args.no_wait:
+        remaining = _wait_for_no_matching_instances(
+            brev_client,
+            args.name_prefix,
+            timeout_seconds=args.timeout_seconds,
+            poll_seconds=args.poll_seconds,
+        )
+    _write_json(stdout, {"deleted": names, "remaining": remaining, "outputs": outputs})
+    return 0 if not remaining else 2
 
 
 def _inventory_refresh(
@@ -279,6 +297,16 @@ def _matching_instance_names(
     client: BrevClient,
     name_prefix: str,
 ) -> list[str]:
+    names = _matching_instance_names_or_empty(client, name_prefix)
+    if not names:
+        raise PlanError(f"no instances found for name_prefix {name_prefix.strip()!r}")
+    return names
+
+
+def _matching_instance_names_or_empty(
+    client: BrevClient,
+    name_prefix: str,
+) -> list[str]:
     prefix = name_prefix.strip()
     if len(prefix) < 3:
         raise PlanError("name_prefix must be at least 3 characters")
@@ -287,9 +315,25 @@ def _matching_instance_names(
         for instance in client.list_instances()
         if str(instance.get("name", "")).startswith(f"{prefix}-")
     ]
-    if not names:
-        raise PlanError(f"no instances found for name_prefix {prefix!r}")
     return sorted(names)
+
+
+def _wait_for_no_matching_instances(
+    client: BrevClient,
+    name_prefix: str,
+    *,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> list[str]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = _matching_instance_names_or_empty(client, name_prefix)
+        if not remaining:
+            return []
+        if time.monotonic() >= deadline:
+            return remaining
+        if poll_seconds > 0:
+            time.sleep(poll_seconds)
 
 
 def _require_active_org(client: BrevClient, required_org: str | None) -> None:

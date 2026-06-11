@@ -1,0 +1,92 @@
+# Brev Control Plane
+
+`brev-control-plane` is a small Python CLI scaffold for planning and tracking
+NVIDIA Brev instances that run distributed shell jobs.
+
+The project is intentionally generic. It is meant for arbitrary command-line
+workloads such as batch scripts, test shards, data processing jobs, or other
+shell commands that can run across a temporary fleet.
+
+## Current Scope
+
+Implemented commands:
+
+- `doctor` checks local prerequisites.
+- `fleet plan` produces a dry-run fleet plan.
+- `inventory refresh` records `brev ls --json` output in a local SQLite database.
+- `jobs validate` validates a generic shell-job JSON spec.
+
+Safety defaults:
+
+- No command creates instances.
+- No command deletes instances.
+- Fleet planning emits JSON that can be reviewed by another tool or human.
+
+Future versions can add explicit, confirmation-gated provisioning and cleanup
+commands while keeping planning and state management testable.
+
+## Install
+
+```bash
+python3 -m pip install -e ".[test]"
+```
+
+The runtime package uses the Python standard library. Tests use `pytest`.
+
+## CLI Examples
+
+Check local setup:
+
+```bash
+brev-control-plane doctor
+```
+
+Create a dry-run plan for four workers:
+
+```bash
+brev-control-plane fleet plan \
+  --workers 4 \
+  --cpu-min-vcpus 8 \
+  --cpu-min-memory-gb 32 \
+  --region us-west \
+  --name-prefix worker
+```
+
+Refresh local inventory from Brev:
+
+```bash
+brev-control-plane inventory refresh --db ./fleet.sqlite3
+```
+
+Validate a job spec:
+
+```bash
+brev-control-plane jobs validate ./job.json
+```
+
+Example `job.json`:
+
+```json
+{
+  "command": "bash -lc 'python3 -m pytest -q'",
+  "env": {
+    "JOB_MODE": "ci"
+  },
+  "artifacts": [
+    "logs/",
+    "reports/"
+  ],
+  "max_runtime_seconds": 3600
+}
+```
+
+## Development
+
+Run tests:
+
+```bash
+python3 -m pytest -q
+```
+
+The Brev adapter is isolated behind `BrevClient`, so tests can use fake runners
+without requiring the real `brev` binary.

@@ -40,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_apply.add_argument("--type", required=True, dest="instance_type")
     fleet_apply.add_argument("--name-prefix", default="worker")
     fleet_apply.add_argument("--timeout-seconds", type=int, default=900)
+    fleet_apply.add_argument("--require-org")
     fleet_apply.add_argument("--yes", action="store_true")
     fleet_exec = fleet_subparsers.add_parser(
         "exec",
@@ -160,6 +161,7 @@ def _fleet_apply(
         name_prefix=args.name_prefix,
     )
     brev_client = client or BrevClient()
+    _require_active_org(brev_client, args.require_org)
     created: list[str] = []
     outputs: dict[str, str] = {}
     for worker in plan["workers"]:
@@ -250,6 +252,16 @@ def _matching_instance_names(
     if not names:
         raise PlanError(f"no instances found for name_prefix {prefix!r}")
     return sorted(names)
+
+
+def _require_active_org(client: BrevClient, required_org: str | None) -> None:
+    if not required_org:
+        return
+    active_org = client.active_org()
+    if active_org != required_org:
+        raise PlanError(
+            f"active Brev org is {active_org!r}; expected {required_org!r}"
+        )
 
 
 def _command_from_remainder(remainder: list[str]) -> str:

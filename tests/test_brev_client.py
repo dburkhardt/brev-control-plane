@@ -106,6 +106,32 @@ def test_exec_instances_runs_brev_exec_for_names_and_command():
     ]
 
 
+def test_active_org_parses_starred_brev_org_ls_output():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return Result(stdout="  personal\n* team-a\n  team-b\n")
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert client.active_org() == "team-a"
+    assert calls == [["brev", "org", "ls"]]
+
+
+def test_active_org_raises_when_no_starred_org_is_present():
+    client = BrevClient(
+        binary="brev",
+        runner=lambda argv: Result(stdout="  personal\n  team-a\n"),
+    )
+
+    with pytest.raises(
+        BrevCommandError,
+        match="could not determine active Brev org from 'brev org ls'",
+    ):
+        client.active_org()
+
+
 def test_brev_client_raises_for_nonzero_exit():
     client = BrevClient(
         binary="brev",

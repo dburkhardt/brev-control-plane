@@ -11,6 +11,7 @@ class FakeBrevClient:
         self.deleted = []
         self.exec_calls = []
         self.instances = [{"id": "inst-1", "name": "worker", "status": "running"}]
+        self.org = "personal"
 
     def list_instances(self):
         self.refreshed = True
@@ -18,6 +19,9 @@ class FakeBrevClient:
 
     def search_cpu(self):
         return [{"type": "cpu-small", "vcpus": 4}]
+
+    def active_org(self):
+        return self.org
 
     def create_instance(self, *, name, instance_type, timeout_seconds):
         self.created.append(
@@ -128,6 +132,36 @@ def test_cli_fleet_apply_creates_named_instances_with_confirmation():
     ]
     payload = json.loads(stdout.getvalue())
     assert payload["created"] == ["smoke-001", "smoke-002"]
+
+
+def test_cli_fleet_apply_rejects_unexpected_active_org():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    client = FakeBrevClient()
+    client.org = "personal"
+
+    code = main(
+        [
+            "fleet",
+            "apply",
+            "--workers",
+            "1",
+            "--type",
+            "n2d-highcpu-2",
+            "--name-prefix",
+            "smoke",
+            "--require-org",
+            "team-a",
+            "--yes",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+        client=client,
+    )
+
+    assert code == 2
+    assert client.created == []
+    assert "active Brev org is 'personal'" in json.loads(stderr.getvalue())["error"]
 
 
 def test_cli_fleet_exec_runs_command_on_matching_instances():

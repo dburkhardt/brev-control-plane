@@ -53,6 +53,16 @@ class BrevClient:
         result = self._run(["delete", name])
         return result.stdout.strip()
 
+    def active_org(self) -> str:
+        result = self._run(["org", "ls"])
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("* "):
+                parts = stripped[2:].split()
+                if parts:
+                    return parts[0]
+        raise BrevCommandError("could not determine active Brev org from 'brev org ls'")
+
     def exec_instances(
         self,
         names: list[str],

@@ -15,19 +15,23 @@ Implemented commands:
 - `fleet plan` produces a dry-run fleet plan.
 - `fleet apply` creates explicitly typed instances when `--yes` is present.
 - `fleet exec` runs a generic shell command on instances matching a name prefix.
-- `fleet down` deletes instances matching a name prefix when `--yes` is present.
+- `fleet check` runs generic host capability probes on matching instances.
+- `fleet down` deletes instances matching a name prefix when `--yes` is present,
+  then waits for cleanup unless `--no-wait` is set.
 - `inventory refresh` records `brev ls --json` output in a local SQLite database.
 - `jobs validate` validates a generic shell-job JSON spec.
+- `jobs run` copies an optional source bundle and runs a generic shell-job spec.
 
 Safety defaults:
 
 - `fleet plan` never creates instances.
 - `fleet apply` requires an explicit instance type and `--yes`.
 - `fleet down` only deletes names matching a prefix and requires `--yes`.
+- Live fleet and job commands can use `--require-org` to fail fast if the active
+  Brev org is not the expected org.
+- Live fleet and job commands can use `--db` to record generic audit events in
+  SQLite without storing secrets.
 - Fleet planning emits JSON that can be reviewed by another tool or human.
-
-Future versions can add explicit, confirmation-gated provisioning and cleanup
-commands while keeping planning and state management testable.
 
 ## Install
 
@@ -63,7 +67,18 @@ brev-control-plane fleet apply \
   --workers 2 \
   --type n2d-highcpu-2 \
   --name-prefix worker \
+  --require-org personal \
+  --db ./fleet.sqlite3 \
   --yes
+```
+
+Check generic machine capabilities:
+
+```bash
+brev-control-plane fleet check \
+  --name-prefix worker \
+  --require-org personal \
+  --db ./fleet.sqlite3
 ```
 
 Run a command on those workers:
@@ -71,13 +86,29 @@ Run a command on those workers:
 ```bash
 brev-control-plane fleet exec \
   --name-prefix worker \
+  --require-org personal \
+  --db ./fleet.sqlite3 \
   -- bash -lc 'hostname && curl -s https://ifconfig.me'
+```
+
+Run a generic bundle job:
+
+```bash
+brev-control-plane jobs run ./job.json \
+  --name-prefix worker \
+  --require-org personal \
+  --db ./fleet.sqlite3 \
+  --host
 ```
 
 Delete those workers:
 
 ```bash
-brev-control-plane fleet down --name-prefix worker --yes
+brev-control-plane fleet down \
+  --name-prefix worker \
+  --require-org personal \
+  --db ./fleet.sqlite3 \
+  --yes
 ```
 
 Refresh local inventory from Brev:
@@ -96,13 +127,22 @@ Example `job.json`:
 
 ```json
 {
-  "command": "bash -lc 'python3 -m pytest -q'",
+  "command": "python3 -m pytest -q",
   "env": {
     "JOB_MODE": "ci"
   },
+  "bundle": {
+    "source": "./example-project",
+    "exclude": [
+      ".git",
+      ".venv",
+      "runs",
+      "dist"
+    ]
+  },
   "artifacts": [
-    "logs/",
-    "reports/"
+    "reports/",
+    "logs/"
   ],
   "max_runtime_seconds": 3600
 }

@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from typing import Any, TextIO
 
 from .brev import BrevClient, BrevCommandError
@@ -298,15 +299,33 @@ def _fleet_down(
     _require_active_org(brev_client, args.require_org)
     store = _state_store(args.db)
     names = _matching_instance_names(brev_client, args.name_prefix)
-    outputs = {name: brev_client.delete_instance(name) for name in names}
-    if store is not None:
-        for name in names:
-            store.record_live_event(
-                "fleet.down.deleted",
-                instance_name=name,
-                payload={"output": outputs[name]},
-            )
-    remaining: list[str] = []
+    deleted: list[str] = []
+    outputs: dict[str, str] = {}
+    delete_results: list[dict[str, Any]] = []
+    for name in names:
+        try:
+            output = brev_client.delete_instance(name)
+        except BrevCommandError as exc:
+            error = str(exc)
+            delete_results.append({"instance": name, "ok": False, "error": error})
+            if store is not None:
+                store.record_live_event(
+                    "fleet.down.failed",
+                    instance_name=name,
+                    payload={"error": error},
+                )
+        else:
+            deleted.append(name)
+            outputs[name] = output
+            delete_results.append({"instance": name, "ok": True, "output": output})
+            if store is not None:
+                store.record_live_event(
+                    "fleet.down.deleted",
+                    instance_name=name,
+                    payload={"output": output},
+                )
+    delete_failed = any(not result["ok"] for result in delete_results)
+    remaining: list[str] = list(names) if args.no_wait else []
     if not args.no_wait:
         remaining = _wait_for_no_matching_instances(
             brev_client,
@@ -321,8 +340,16 @@ def _fleet_down(
                     instance_name=name,
                     payload={"remaining": remaining},
                 )
-    _write_json(stdout, {"deleted": names, "remaining": remaining, "outputs": outputs})
-    return 0 if not remaining else 2
+    _write_json(
+        stdout,
+        {
+            "deleted": deleted,
+            "remaining": remaining,
+            "outputs": outputs,
+            "delete_results": delete_results,
+        },
+    )
+    return 2 if delete_failed or remaining else 0
 
 
 def _inventory_refresh(
@@ -359,15 +386,22 @@ def _jobs_run(
 ) -> int:
     spec_path = Path(args.path)
     spec = load_job_spec(spec_path)
+    if spec.artifacts:
+        raise JobSpecError("artifact collection is not implemented for jobs run")
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
     store = _state_store(args.db)
     names = _matching_instance_names(brev_client, args.name_prefix)
+    run_id = uuid.uuid4().hex
 
     with tempfile.TemporaryDirectory() as temp_dir:
         local_archive: Path | None = None
+        remote_archive: str | None = None
+        remote_dir: str | None = None
         if spec.bundle is not None:
             local_archive = _create_job_archive(spec, spec_path, Path(temp_dir))
+            remote_dir = f"/tmp/brev-control-plane-job-{run_id}"
+            remote_archive = f"{remote_dir}.tar.gz"
 
         results: list[dict[str, Any]] = []
         for name in names:
@@ -376,11 +410,15 @@ def _jobs_run(
                     brev_client.copy_to_instance(
                         local_archive,
                         name,
-                        "/tmp/brev-control-plane-job.tar.gz",
+                        str(remote_archive),
                     )
                 output = brev_client.exec_instance(
                     name,
-                    _job_remote_command(spec, bundle_enabled=local_archive is not None),
+                    _job_remote_command(
+                        spec,
+                        remote_archive=remote_archive,
+                        remote_dir=remote_dir,
+                    ),
                     host=args.host,
                 )
             except BrevCommandError as exc:
@@ -484,15 +522,20 @@ def _create_job_archive(spec: JobSpec, spec_path: Path, temp_dir: Path) -> Path:
     )
 
 
-def _job_remote_command(spec: JobSpec, *, bundle_enabled: bool) -> str:
+def _job_remote_command(
+    spec: JobSpec,
+    *,
+    remote_archive: str | None,
+    remote_dir: str | None,
+) -> str:
     command = _job_shell_invocation(spec)
-    if not bundle_enabled:
+    if remote_archive is None or remote_dir is None:
         return command
     setup = [
-        "rm -rf /tmp/brev-control-plane-job",
-        "mkdir -p /tmp/brev-control-plane-job",
-        "tar -xzf /tmp/brev-control-plane-job.tar.gz -C /tmp/brev-control-plane-job",
-        "cd /tmp/brev-control-plane-job",
+        f"rm -rf {shlex.quote(remote_dir)}",
+        f"mkdir -p {shlex.quote(remote_dir)}",
+        f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_dir)}",
+        f"cd {shlex.quote(remote_dir)}",
     ]
     return " && ".join([*setup, command])
 
@@ -500,8 +543,12 @@ def _job_remote_command(spec: JobSpec, *, bundle_enabled: bool) -> str:
 def _job_shell_invocation(spec: JobSpec) -> str:
     env_args = [f"{key}={value}" for key, value in spec.env.items()]
     if env_args:
-        return shlex.join(["env", *env_args, "bash", "-lc", spec.command])
-    return shlex.join(["bash", "-lc", spec.command])
+        command = ["env", *env_args, "bash", "-lc", spec.command]
+    else:
+        command = ["bash", "-lc", spec.command]
+    if spec.max_runtime_seconds is not None:
+        command = ["timeout", str(spec.max_runtime_seconds), *command]
+    return shlex.join(command)
 
 
 def _command_from_remainder(remainder: list[str]) -> str:

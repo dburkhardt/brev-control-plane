@@ -11,6 +11,7 @@ class FakeBrevClient:
         self.refreshed = False
         self.created = []
         self.deleted = []
+        self.delete_outputs = {}
         self.exec_calls = []
         self.exec_outputs = {}
         self.copy_calls = []
@@ -44,7 +45,10 @@ class FakeBrevClient:
 
     def delete_instance(self, name):
         self.deleted.append(name)
-        return f"deleted {name}"
+        output = self.delete_outputs.get(name, f"deleted {name}")
+        if isinstance(output, Exception):
+            raise output
+        return output
 
     def exec_instances(self, names, command, *, host=False):
         self.exec_calls.append({"names": names, "command": command, "host": host})
@@ -401,11 +405,15 @@ def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():
         client=client,
     )
 
-    assert code == 0
+    assert code == 2
     assert client.deleted == ["smoke-001", "smoke-002"]
     payload = json.loads(stdout.getvalue())
     assert payload["deleted"] == ["smoke-001", "smoke-002"]
-    assert payload["remaining"] == []
+    assert payload["remaining"] == ["smoke-001", "smoke-002"]
+    assert payload["delete_results"] == [
+        {"instance": "smoke-001", "ok": True, "output": "deleted smoke-001"},
+        {"instance": "smoke-002", "ok": True, "output": "deleted smoke-002"},
+    ]
 
 
 def test_cli_fleet_down_records_deleted_events(tmp_path):
@@ -429,7 +437,7 @@ def test_cli_fleet_down_records_deleted_events(tmp_path):
         client=client,
     )
 
-    assert code == 0
+    assert code == 2
     events = StateStore(db_path).list_events()
     assert [(event["event_type"], event["payload"]) for event in events] == [
         (
@@ -501,6 +509,54 @@ def test_cli_fleet_down_returns_two_when_wait_times_out():
     assert code == 2
     payload = json.loads(stdout.getvalue())
     assert payload["remaining"] == ["smoke-001"]
+
+
+def test_cli_fleet_down_attempts_all_deletes_and_reports_failures(tmp_path):
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [
+        {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+        {"id": "inst-2", "name": "smoke-002", "status": "RUNNING"},
+        {"id": "inst-3", "name": "smoke-003", "status": "RUNNING"},
+    ]
+    client.delete_outputs = {"smoke-002": BrevCommandError("delete failed")}
+    db_path = tmp_path / "state.db"
+
+    code = main(
+        [
+            "fleet",
+            "down",
+            "--name-prefix",
+            "smoke",
+            "--db",
+            str(db_path),
+            "--yes",
+            "--no-wait",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    assert client.deleted == ["smoke-001", "smoke-002", "smoke-003"]
+    payload = json.loads(stdout.getvalue())
+    assert payload["deleted"] == ["smoke-001", "smoke-003"]
+    assert payload["remaining"] == ["smoke-001", "smoke-002", "smoke-003"]
+    assert payload["delete_results"] == [
+        {"instance": "smoke-001", "ok": True, "output": "deleted smoke-001"},
+        {"instance": "smoke-002", "ok": False, "error": "delete failed"},
+        {"instance": "smoke-003", "ok": True, "output": "deleted smoke-003"},
+    ]
+    events = StateStore(db_path).list_events()
+    assert [event["event_type"] for event in events] == [
+        "fleet.down.deleted",
+        "fleet.down.failed",
+        "fleet.down.deleted",
+    ]
+    assert events[1]["payload"] == {
+        "instance_name": "smoke-002",
+        "error": "delete failed",
+    }
 
 
 def test_cli_fleet_down_records_wait_timeout_events(tmp_path):
@@ -583,7 +639,6 @@ def test_cli_jobs_run_copies_bundle_and_executes_command(tmp_path):
             {
                 "command": "python3 -m pytest -q",
                 "bundle": {"source": str(source), "exclude": [".git"]},
-                "artifacts": ["reports/"],
             }
         ),
         encoding="utf-8",
@@ -604,10 +659,12 @@ def test_cli_jobs_run_copies_bundle_and_executes_command(tmp_path):
         {
             "local_path": client.copy_calls[0]["local_path"],
             "instance_name": "smoke-001",
-            "remote_path": "/tmp/brev-control-plane-job.tar.gz",
+            "remote_path": client.copy_calls[0]["remote_path"],
         }
     ]
     assert client.copy_calls[0]["local_path"].endswith(".tar.gz")
+    assert client.copy_calls[0]["remote_path"].startswith("/tmp/brev-control-plane-job-")
+    assert client.copy_calls[0]["remote_path"].endswith(".tar.gz")
     assert client.exec_calls == [
         {
             "name": "smoke-001",
@@ -615,11 +672,58 @@ def test_cli_jobs_run_copies_bundle_and_executes_command(tmp_path):
             "host": True,
         }
     ]
-    assert "tar -xzf /tmp/brev-control-plane-job.tar.gz" in client.exec_calls[0]["command"]
-    assert "cd /tmp/brev-control-plane-job" in client.exec_calls[0]["command"]
+    remote_archive = client.copy_calls[0]["remote_path"]
+    remote_dir = remote_archive.removesuffix(".tar.gz")
+    assert f"tar -xzf {remote_archive}" in client.exec_calls[0]["command"]
+    assert f"cd {remote_dir}" in client.exec_calls[0]["command"]
     assert "python3 -m pytest -q" in client.exec_calls[0]["command"]
     payload = json.loads(stdout.getvalue())
     assert payload["instances"] == ["smoke-001"]
     assert payload["results"] == [
         {"instance": "smoke-001", "ok": True, "output": "1 passed"}
+    ]
+
+
+def test_cli_jobs_run_rejects_artifacts_until_collection_is_implemented(tmp_path):
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps({"command": "echo hi", "artifacts": ["reports/"]}),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+
+    code = main(
+        ["jobs", "run", str(job_path), "--name-prefix", "smoke"],
+        stdout=stdout,
+        stderr=stderr,
+        client=client,
+    )
+
+    assert code == 2
+    assert client.exec_calls == []
+    assert "artifact collection is not implemented" in json.loads(stderr.getvalue())["error"]
+
+
+def test_cli_jobs_run_wraps_command_with_timeout_when_runtime_limit_is_set(tmp_path):
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps({"command": "echo hi", "max_runtime_seconds": 30}),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+
+    code = main(
+        ["jobs", "run", str(job_path), "--name-prefix", "smoke"],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert client.exec_calls == [
+        {"name": "smoke-001", "command": "timeout 30 bash -lc 'echo hi'", "host": False}
     ]

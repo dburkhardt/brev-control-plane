@@ -29,8 +29,9 @@ Safety defaults:
 - `fleet down` only deletes names matching a prefix and requires `--yes`.
 - Live fleet and job commands can use `--require-org` to fail fast if the active
   Brev org is not the expected org.
-- Live fleet and job commands can use `--db` to record generic audit events in
-  SQLite without storing secrets.
+- Live fleet and job commands can use `--db` to record generic command and
+  result metadata in SQLite. Avoid putting secrets in commands or outputs when
+  audit logging is enabled.
 - Fleet planning emits JSON that can be reviewed by another tool or human.
 
 ## Install
@@ -140,13 +141,13 @@ Example `job.json`:
       "dist"
     ]
   },
-  "artifacts": [
-    "reports/",
-    "logs/"
-  ],
   "max_runtime_seconds": 3600
 }
 ```
+
+`jobs validate` accepts an `artifacts` array in job specs, but `jobs run`
+currently rejects artifact collection because copy-back support is not
+implemented yet.
 
 ## Development
 

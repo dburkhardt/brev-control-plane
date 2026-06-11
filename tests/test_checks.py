@@ -6,8 +6,8 @@ def test_build_check_command_collects_generic_machine_capabilities():
 
     assert command.startswith("bash -lc ")
     assert "ifconfig.me" in command
-    assert "docker --version" in command
-    assert "sudo docker --version" in command
+    assert "timeout 10 docker --version" in command
+    assert "timeout 10 sudo -n docker --version" in command
     assert "python3 --version" in command
     assert "df -h /" in command
 

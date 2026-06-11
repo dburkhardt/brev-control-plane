@@ -1,6 +1,6 @@
 # Live Control Hardening Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For implementers:** Follow this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Harden `brev-control-plane` after the first live two-machine smoke so fleet creation, checks, command execution, job bundles, audit logging, and teardown are safer and easier to operate.
 
@@ -412,7 +412,7 @@ def test_build_check_command_is_generic_shell_probe():
     command = build_check_command()
 
     assert "https://ifconfig.me" in command
-    assert "sudo docker --version" in command
+    assert "timeout 10 sudo -n docker --version" in command
     assert "python3 --version" in command
 ```
 
@@ -443,8 +443,8 @@ def build_check_command() -> str:
         "echo UNAME=$(uname -srm); "
         "echo USER=$(whoami); "
         "echo DOCKER_PATH=$(command -v docker || true); "
-        "echo DOCKER_DIRECT=$(docker --version 2>&1 || true); "
-        "echo DOCKER_SUDO=$(sudo docker --version 2>&1 || true); "
+        "echo DOCKER_DIRECT=$(timeout 10 docker --version 2>&1 || true); "
+        "echo DOCKER_SUDO=$(timeout 10 sudo -n docker --version 2>&1 || true); "
         "echo PYTHON3=$(python3 --version 2>&1 || true); "
         "echo DISK_ROOT=$(df -h / | tail -1)"
         "'"
@@ -1196,9 +1196,11 @@ def _jobs_run(args: argparse.Namespace, stdout: TextIO, client: BrevClient | Non
     results = []
     for name in names:
         if archive_path:
-            brev_client.copy_to_instance(str(archive_path), name, "/tmp/brev-control-plane-job.tgz")
-            setup = "rm -rf /tmp/brev-control-plane-job && mkdir -p /tmp/brev-control-plane-job && tar -xzf /tmp/brev-control-plane-job.tgz -C /tmp/brev-control-plane-job"
-            command = f"bash -lc {shlex.quote(setup + ' && cd /tmp/brev-control-plane-job && ' + spec.command)}"
+            remote_dir = "/tmp/brev-control-plane-job-<run-id>"
+            remote_archive = f"{remote_dir}.tgz"
+            brev_client.copy_to_instance(str(archive_path), name, remote_archive)
+            setup = f"rm -rf {remote_dir} && mkdir -p {remote_dir} && tar -xzf {remote_archive} -C {remote_dir}"
+            command = f"bash -lc {shlex.quote(setup + ' && cd ' + remote_dir + ' && ' + spec.command)}"
         else:
             command = spec.command
         output = brev_client.exec_instance(name, command, host=args.host)

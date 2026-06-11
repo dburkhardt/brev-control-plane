@@ -30,6 +30,43 @@ class BrevClient:
     def search_cpu(self) -> list[dict[str, Any]]:
         return self._run_json(["search", "cpu", "--json"])
 
+    def create_instance(
+        self,
+        *,
+        name: str,
+        instance_type: str,
+        timeout_seconds: int,
+    ) -> str:
+        result = self._run(
+            [
+                "create",
+                name,
+                "--type",
+                instance_type,
+                "--timeout",
+                str(timeout_seconds),
+            ]
+        )
+        return result.stdout.strip()
+
+    def delete_instance(self, name: str) -> str:
+        result = self._run(["delete", name])
+        return result.stdout.strip()
+
+    def exec_instances(
+        self,
+        names: list[str],
+        command: str,
+        *,
+        host: bool = False,
+    ) -> str:
+        args = ["exec", *names]
+        if host:
+            args.append("--host")
+        args.append(command)
+        result = self._run(args)
+        return result.stdout.strip()
+
     def _run_json(self, args: list[str]) -> list[dict[str, Any]]:
         return self._expect_json_array(self._run_json_payload(args))
 

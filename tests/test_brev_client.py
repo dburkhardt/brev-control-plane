@@ -45,6 +45,67 @@ def test_search_cpu_parses_brev_search_cpu_json():
     assert client.search_cpu() == [{"type": "cpu-small", "vcpus": 4}]
 
 
+def test_create_instance_runs_brev_create_with_type_and_timeout():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return Result(stdout="created")
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert (
+        client.create_instance(
+            name="smoke-001",
+            instance_type="n2d-highcpu-2",
+            timeout_seconds=900,
+        )
+        == "created"
+    )
+    assert calls == [
+        [
+            "brev",
+            "create",
+            "smoke-001",
+            "--type",
+            "n2d-highcpu-2",
+            "--timeout",
+            "900",
+        ]
+    ]
+
+
+def test_delete_instance_runs_brev_delete():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return Result(stdout="deleted")
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert client.delete_instance("smoke-001") == "deleted"
+    assert calls == [["brev", "delete", "smoke-001"]]
+
+
+def test_exec_instances_runs_brev_exec_for_names_and_command():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return Result(stdout="ran")
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert (
+        client.exec_instances(["smoke-001", "smoke-002"], "echo hello", host=True)
+        == "ran"
+    )
+    assert calls == [
+        ["brev", "exec", "smoke-001", "smoke-002", "--host", "echo hello"]
+    ]
+
+
 def test_brev_client_raises_for_nonzero_exit():
     client = BrevClient(
         binary="brev",

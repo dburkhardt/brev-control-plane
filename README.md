@@ -13,13 +13,17 @@ Implemented commands:
 
 - `doctor` checks local prerequisites.
 - `fleet plan` produces a dry-run fleet plan.
+- `fleet apply` creates explicitly typed instances when `--yes` is present.
+- `fleet exec` runs a generic shell command on instances matching a name prefix.
+- `fleet down` deletes instances matching a name prefix when `--yes` is present.
 - `inventory refresh` records `brev ls --json` output in a local SQLite database.
 - `jobs validate` validates a generic shell-job JSON spec.
 
 Safety defaults:
 
-- No command creates instances.
-- No command deletes instances.
+- `fleet plan` never creates instances.
+- `fleet apply` requires an explicit instance type and `--yes`.
+- `fleet down` only deletes names matching a prefix and requires `--yes`.
 - Fleet planning emits JSON that can be reviewed by another tool or human.
 
 Future versions can add explicit, confirmation-gated provisioning and cleanup
@@ -50,6 +54,30 @@ brev-control-plane fleet plan \
   --cpu-min-memory-gb 32 \
   --region us-west \
   --name-prefix worker
+```
+
+Create two explicitly typed workers:
+
+```bash
+brev-control-plane fleet apply \
+  --workers 2 \
+  --type n2d-highcpu-2 \
+  --name-prefix worker \
+  --yes
+```
+
+Run a command on those workers:
+
+```bash
+brev-control-plane fleet exec \
+  --name-prefix worker \
+  -- bash -lc 'hostname && curl -s https://ifconfig.me'
+```
+
+Delete those workers:
+
+```bash
+brev-control-plane fleet down --name-prefix worker --yes
 ```
 
 Refresh local inventory from Brev:

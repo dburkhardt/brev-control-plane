@@ -13,6 +13,7 @@ class FakeBrevClient:
         self.deleted = []
         self.exec_calls = []
         self.exec_outputs = {}
+        self.copy_calls = []
         self.instances = [{"id": "inst-1", "name": "worker", "status": "running"}]
         self.list_results = None
         self.org = "personal"
@@ -55,6 +56,16 @@ class FakeBrevClient:
         if isinstance(output, Exception):
             raise output
         return output
+
+    def copy_to_instance(self, local_path, instance_name, remote_path):
+        self.copy_calls.append(
+            {
+                "local_path": str(local_path),
+                "instance_name": instance_name,
+                "remote_path": remote_path,
+            }
+        )
+        return f"copied {instance_name}"
 
 
 def test_cli_fleet_plan_outputs_json():
@@ -557,3 +568,58 @@ def test_cli_jobs_validate_outputs_valid_status(tmp_path):
     assert code == 0
     payload = json.loads(stdout.getvalue())
     assert payload == {"valid": True, "command": "echo hi"}
+
+
+def test_cli_jobs_run_copies_bundle_and_executes_command(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "test_example.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    ignored = source / ".git"
+    ignored.mkdir()
+    (ignored / "config").write_text("ignored", encoding="utf-8")
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "python3 -m pytest -q",
+                "bundle": {"source": str(source), "exclude": [".git"]},
+                "artifacts": ["reports/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "1 passed"}
+
+    code = main(
+        ["jobs", "run", str(job_path), "--name-prefix", "smoke", "--host"],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert client.copy_calls == [
+        {
+            "local_path": client.copy_calls[0]["local_path"],
+            "instance_name": "smoke-001",
+            "remote_path": "/tmp/brev-control-plane-job.tar.gz",
+        }
+    ]
+    assert client.copy_calls[0]["local_path"].endswith(".tar.gz")
+    assert client.exec_calls == [
+        {
+            "name": "smoke-001",
+            "command": client.exec_calls[0]["command"],
+            "host": True,
+        }
+    ]
+    assert "tar -xzf /tmp/brev-control-plane-job.tar.gz" in client.exec_calls[0]["command"]
+    assert "cd /tmp/brev-control-plane-job" in client.exec_calls[0]["command"]
+    assert "python3 -m pytest -q" in client.exec_calls[0]["command"]
+    payload = json.loads(stdout.getvalue())
+    assert payload["instances"] == ["smoke-001"]
+    assert payload["results"] == [
+        {"instance": "smoke-001", "ok": True, "output": "1 passed"}
+    ]

@@ -19,6 +19,21 @@ def test_validate_job_spec_accepts_minimal_shell_job():
     assert spec.env == {"EXAMPLE": "value"}
     assert spec.artifacts == ["outputs/"]
     assert spec.max_runtime_seconds == 120
+    assert spec.bundle is None
+
+
+def test_validate_job_spec_accepts_bundle_object():
+    spec = validate_job_spec(
+        {
+            "command": "python3 -m pytest -q",
+            "bundle": {"source": "./example-project", "exclude": [".git", ".venv"]},
+        }
+    )
+
+    assert spec.bundle == {
+        "source": "./example-project",
+        "exclude": [".git", ".venv"],
+    }
 
 
 def test_validate_job_spec_applies_safe_defaults():
@@ -44,6 +59,7 @@ def test_validate_job_spec_applies_safe_defaults():
             {"command": "echo hi", "max_runtime_seconds": True},
             "max_runtime_seconds must be positive",
         ),
+        ({"command": "echo hi", "bundle": []}, "bundle must be an object"),
     ],
 )
 def test_validate_job_spec_rejects_invalid_payloads(payload, message):

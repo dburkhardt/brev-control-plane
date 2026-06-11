@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import subprocess
 from typing import Any, Callable, Protocol
 
@@ -89,6 +90,17 @@ class BrevClient:
             args.append("--host")
         args.append(command)
         result = self._run(args)
+        return result.stdout.strip()
+
+    def copy_to_instance(
+        self,
+        local_path: str | Path,
+        instance_name: str,
+        remote_path: str,
+    ) -> str:
+        result = self._run(
+            ["copy", str(local_path), f"{instance_name}:{remote_path}"]
+        )
         return result.stdout.strip()
 
     def _run_json(self, args: list[str]) -> list[dict[str, Any]]:

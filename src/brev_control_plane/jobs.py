@@ -16,6 +16,7 @@ class JobSpec:
     env: dict[str, str]
     artifacts: list[str]
     max_runtime_seconds: int | None
+    bundle: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -23,6 +24,7 @@ class JobSpec:
             "env": dict(self.env),
             "artifacts": list(self.artifacts),
             "max_runtime_seconds": self.max_runtime_seconds,
+            "bundle": dict(self.bundle) if self.bundle is not None else None,
         }
 
 
@@ -63,11 +65,16 @@ def validate_job_spec(payload: Any) -> JobSpec:
     if max_runtime_seconds is not None and not _is_positive_int(max_runtime_seconds):
         raise JobSpecError("max_runtime_seconds must be positive")
 
+    bundle = payload.get("bundle")
+    if bundle is not None and not isinstance(bundle, dict):
+        raise JobSpecError("bundle must be an object")
+
     return JobSpec(
         command=command,
         env=dict(env),
         artifacts=list(artifacts),
         max_runtime_seconds=max_runtime_seconds,
+        bundle=dict(bundle) if bundle is not None else None,
     )
 
 

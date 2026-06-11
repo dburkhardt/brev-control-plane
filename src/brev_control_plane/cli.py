@@ -6,12 +6,14 @@ from pathlib import Path
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 from typing import Any, TextIO
 
 from .brev import BrevClient, BrevCommandError
+from .bundles import BundleError, create_bundle_archive
 from .checks import build_check_command, parse_check_output
-from .jobs import JobSpecError, load_job_spec
+from .jobs import JobSpec, JobSpecError, load_job_spec
 from .planner import CpuFilter, PlanError, plan_fleet
 from .state import StateStore
 
@@ -89,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_subparsers = jobs.add_subparsers(dest="jobs_command", required=True)
     validate = jobs_subparsers.add_parser("validate", help="Validate a job JSON file.")
     validate.add_argument("path")
+    run = jobs_subparsers.add_parser("run", help="Run a generic shell job on a fleet.")
+    run.add_argument("path")
+    run.add_argument("--name-prefix", required=True)
+    run.add_argument("--require-org")
+    run.add_argument("--db")
+    run.add_argument("--host", action="store_true")
 
     return parser
 
@@ -122,7 +130,9 @@ def main(
             return _inventory_refresh(args, stdout, client)
         if args.command == "jobs" and args.jobs_command == "validate":
             return _jobs_validate(args, stdout)
-    except (BrevCommandError, JobSpecError, PlanError) as exc:
+        if args.command == "jobs" and args.jobs_command == "run":
+            return _jobs_run(args, stdout, client)
+    except (BrevCommandError, BundleError, JobSpecError, PlanError) as exc:
         _write_json(stderr, {"error": str(exc)})
         return 2
 
@@ -342,6 +352,59 @@ def _jobs_validate(args: argparse.Namespace, stdout: TextIO) -> int:
     return 0
 
 
+def _jobs_run(
+    args: argparse.Namespace,
+    stdout: TextIO,
+    client: BrevClient | None,
+) -> int:
+    spec_path = Path(args.path)
+    spec = load_job_spec(spec_path)
+    brev_client = client or BrevClient()
+    _require_active_org(brev_client, args.require_org)
+    store = _state_store(args.db)
+    names = _matching_instance_names(brev_client, args.name_prefix)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        local_archive: Path | None = None
+        if spec.bundle is not None:
+            local_archive = _create_job_archive(spec, spec_path, Path(temp_dir))
+
+        results: list[dict[str, Any]] = []
+        for name in names:
+            try:
+                if local_archive is not None:
+                    brev_client.copy_to_instance(
+                        local_archive,
+                        name,
+                        "/tmp/brev-control-plane-job.tar.gz",
+                    )
+                output = brev_client.exec_instance(
+                    name,
+                    _job_remote_command(spec, bundle_enabled=local_archive is not None),
+                    host=args.host,
+                )
+            except BrevCommandError as exc:
+                error = str(exc)
+                results.append({"instance": name, "ok": False, "error": error})
+                if store is not None:
+                    store.record_live_event(
+                        "jobs.run.failed",
+                        instance_name=name,
+                        payload={"command": spec.command, "error": error},
+                    )
+            else:
+                results.append({"instance": name, "ok": True, "output": output})
+                if store is not None:
+                    store.record_live_event(
+                        "jobs.run.completed",
+                        instance_name=name,
+                        payload={"command": spec.command, "output": output},
+                    )
+
+    _write_json(stdout, {"instances": names, "results": results})
+    return 0 if all(result["ok"] for result in results) else 2
+
+
 def _matching_instance_names(
     client: BrevClient,
     name_prefix: str,
@@ -401,6 +464,44 @@ def _state_store(path: str | None) -> StateStore | None:
     store = StateStore(Path(path))
     store.initialize()
     return store
+
+
+def _create_job_archive(spec: JobSpec, spec_path: Path, temp_dir: Path) -> Path:
+    bundle = spec.bundle or {}
+    source = bundle.get("source")
+    if not isinstance(source, str) or not source.strip():
+        raise JobSpecError("bundle.source must be a non-empty string")
+    exclude = bundle.get("exclude", [])
+    if not isinstance(exclude, list) or not all(isinstance(item, str) for item in exclude):
+        raise JobSpecError("bundle.exclude must be an array of strings")
+    source_path = Path(source)
+    if not source_path.is_absolute():
+        source_path = spec_path.parent / source_path
+    return create_bundle_archive(
+        source_path,
+        temp_dir / "brev-control-plane-job.tar.gz",
+        exclude_names=exclude,
+    )
+
+
+def _job_remote_command(spec: JobSpec, *, bundle_enabled: bool) -> str:
+    command = _job_shell_invocation(spec)
+    if not bundle_enabled:
+        return command
+    setup = [
+        "rm -rf /tmp/brev-control-plane-job",
+        "mkdir -p /tmp/brev-control-plane-job",
+        "tar -xzf /tmp/brev-control-plane-job.tar.gz -C /tmp/brev-control-plane-job",
+        "cd /tmp/brev-control-plane-job",
+    ]
+    return " && ".join([*setup, command])
+
+
+def _job_shell_invocation(spec: JobSpec) -> str:
+    env_args = [f"{key}={value}" for key, value in spec.env.items()]
+    if env_args:
+        return shlex.join(["env", *env_args, "bash", "-lc", spec.command])
+    return shlex.join(["bash", "-lc", spec.command])
 
 
 def _command_from_remainder(remainder: list[str]) -> str:

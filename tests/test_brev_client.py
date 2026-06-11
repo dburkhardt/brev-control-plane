@@ -119,6 +119,26 @@ def test_exec_instance_runs_brev_exec_for_one_name_and_command():
     assert calls == [["brev", "exec", "smoke-001", "--host", "echo hello"]]
 
 
+def test_copy_to_instance_runs_brev_copy_to_remote_path(tmp_path):
+    calls = []
+    local_path = tmp_path / "bundle.tar.gz"
+    local_path.write_text("data", encoding="utf-8")
+
+    def runner(argv):
+        calls.append(argv)
+        return Result(stdout="copied\n")
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert (
+        client.copy_to_instance(local_path, "smoke-001", "/tmp/job.tar.gz")
+        == "copied"
+    )
+    assert calls == [
+        ["brev", "copy", str(local_path), "smoke-001:/tmp/job.tar.gz"]
+    ]
+
+
 def test_active_org_parses_starred_brev_org_ls_output():
     calls = []
 

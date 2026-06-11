@@ -86,6 +86,17 @@ class StateStore:
             )
             return int(cursor.lastrowid)
 
+    def record_live_event(
+        self,
+        event_type: str,
+        *,
+        instance_name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        event_payload = dict(payload or {})
+        event_payload["instance_name"] = instance_name
+        return self.record_event(event_type, event_payload)
+
     def list_events(self) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as connection:

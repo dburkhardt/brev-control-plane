@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_apply.add_argument("--name-prefix", default="worker")
     fleet_apply.add_argument("--timeout-seconds", type=int, default=900)
     fleet_apply.add_argument("--require-org")
+    fleet_apply.add_argument("--db")
     fleet_apply.add_argument("--yes", action="store_true")
     fleet_exec = fleet_subparsers.add_parser(
         "exec",
@@ -50,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fleet_exec.add_argument("--name-prefix", required=True)
     fleet_exec.add_argument("--require-org")
+    fleet_exec.add_argument("--db")
     fleet_exec.add_argument("--host", action="store_true")
     fleet_exec.add_argument("remote_command", nargs=argparse.REMAINDER)
     fleet_check = fleet_subparsers.add_parser(
@@ -65,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fleet_down.add_argument("--name-prefix", required=True)
     fleet_down.add_argument("--require-org")
+    fleet_down.add_argument("--db")
     fleet_down.add_argument("--timeout-seconds", type=float, default=900.0)
     fleet_down.add_argument("--poll-seconds", type=float, default=10.0)
     fleet_down.add_argument("--no-wait", action="store_true")
@@ -178,6 +181,7 @@ def _fleet_apply(
     )
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
+    store = _state_store(args.db)
     created: list[str] = []
     outputs: dict[str, str] = {}
     for worker in plan["workers"]:
@@ -187,6 +191,15 @@ def _fleet_apply(
             instance_type=args.instance_type,
             timeout_seconds=args.timeout_seconds,
         )
+        if store is not None:
+            store.record_live_event(
+                "fleet.apply.created",
+                instance_name=name,
+                payload={
+                    "instance_type": args.instance_type,
+                    "output": outputs[name],
+                },
+            )
         created.append(name)
     _write_json(
         stdout,
@@ -207,15 +220,29 @@ def _fleet_exec(
     command = _command_from_remainder(args.remote_command)
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
+    store = _state_store(args.db)
     names = _matching_instance_names(brev_client, args.name_prefix)
     results: list[dict[str, Any]] = []
     for name in names:
         try:
             output = brev_client.exec_instance(name, command, host=args.host)
         except BrevCommandError as exc:
-            results.append({"instance": name, "ok": False, "error": str(exc)})
+            error = str(exc)
+            results.append({"instance": name, "ok": False, "error": error})
+            if store is not None:
+                store.record_live_event(
+                    "fleet.exec.failed",
+                    instance_name=name,
+                    payload={"command": command, "error": error},
+                )
         else:
             results.append({"instance": name, "ok": True, "output": output})
+            if store is not None:
+                store.record_live_event(
+                    "fleet.exec.completed",
+                    instance_name=name,
+                    payload={"command": command, "output": output},
+                )
     _write_json(stdout, {"instances": names, "results": results})
     return 0 if all(result["ok"] for result in results) else 2
 
@@ -227,6 +254,7 @@ def _fleet_check(
 ) -> int:
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
+    store = _state_store(args.db)
     names = _matching_instance_names(brev_client, args.name_prefix)
     command = build_check_command()
     checks: list[dict[str, str]] = []
@@ -235,6 +263,12 @@ def _fleet_check(
         report = parse_check_output(output)
         report["name"] = name
         checks.append(report)
+        if store is not None:
+            store.record_live_event(
+                "fleet.check.completed",
+                instance_name=name,
+                payload=report,
+            )
     _write_json(stdout, {"instances": names, "checks": checks})
     return 0
 
@@ -252,8 +286,16 @@ def _fleet_down(
         raise PlanError("poll_seconds must be non-negative")
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
+    store = _state_store(args.db)
     names = _matching_instance_names(brev_client, args.name_prefix)
     outputs = {name: brev_client.delete_instance(name) for name in names}
+    if store is not None:
+        for name in names:
+            store.record_live_event(
+                "fleet.down.deleted",
+                instance_name=name,
+                payload={"output": outputs[name]},
+            )
     remaining: list[str] = []
     if not args.no_wait:
         remaining = _wait_for_no_matching_instances(
@@ -262,6 +304,13 @@ def _fleet_down(
             timeout_seconds=args.timeout_seconds,
             poll_seconds=args.poll_seconds,
         )
+        if remaining and store is not None:
+            for name in remaining:
+                store.record_live_event(
+                    "fleet.down.wait_timeout",
+                    instance_name=name,
+                    payload={"remaining": remaining},
+                )
     _write_json(stdout, {"deleted": names, "remaining": remaining, "outputs": outputs})
     return 0 if not remaining else 2
 
@@ -344,6 +393,14 @@ def _require_active_org(client: BrevClient, required_org: str | None) -> None:
         raise PlanError(
             f"active Brev org is {active_org!r}; expected {required_org!r}"
         )
+
+
+def _state_store(path: str | None) -> StateStore | None:
+    if not path:
+        return None
+    store = StateStore(Path(path))
+    store.initialize()
+    return store
 
 
 def _command_from_remainder(remainder: list[str]) -> str:

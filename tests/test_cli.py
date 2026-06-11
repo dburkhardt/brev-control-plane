@@ -3,6 +3,7 @@ import json
 
 from brev_control_plane.brev import BrevCommandError
 from brev_control_plane.cli import main
+from brev_control_plane.state import StateStore
 
 
 class FakeBrevClient:
@@ -178,6 +179,43 @@ def test_cli_fleet_apply_rejects_unexpected_active_org():
     assert "active Brev org is 'personal'" in json.loads(stderr.getvalue())["error"]
 
 
+def test_cli_fleet_apply_records_created_events(tmp_path):
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    db_path = tmp_path / "state.db"
+
+    code = main(
+        [
+            "fleet",
+            "apply",
+            "--workers",
+            "1",
+            "--type",
+            "n2d-highcpu-2",
+            "--name-prefix",
+            "smoke",
+            "--db",
+            str(db_path),
+            "--yes",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    events = StateStore(db_path).list_events()
+    assert [(event["event_type"], event["payload"]) for event in events] == [
+        (
+            "fleet.apply.created",
+            {
+                "instance_name": "smoke-001",
+                "instance_type": "n2d-highcpu-2",
+                "output": "created smoke-001",
+            },
+        )
+    ]
+
+
 def test_cli_fleet_exec_runs_command_on_matching_instances():
     stdout = io.StringIO()
     client = FakeBrevClient()
@@ -242,6 +280,47 @@ def test_cli_fleet_exec_reports_each_failed_instance():
         {"instance": "smoke-001", "ok": True, "output": "ok"},
         {"instance": "smoke-002", "ok": False, "error": "remote command failed"},
     ]
+
+
+def test_cli_fleet_exec_records_completed_and_failed_events(tmp_path):
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [
+        {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+        {"id": "inst-2", "name": "smoke-002", "status": "RUNNING"},
+    ]
+    client.exec_outputs = {
+        "smoke-001": "ok",
+        "smoke-002": BrevCommandError("remote command failed"),
+    }
+    db_path = tmp_path / "state.db"
+
+    code = main(
+        [
+            "fleet",
+            "exec",
+            "--name-prefix",
+            "smoke",
+            "--db",
+            str(db_path),
+            "--",
+            "uptime",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    events = StateStore(db_path).list_events()
+    assert [event["event_type"] for event in events] == [
+        "fleet.exec.completed",
+        "fleet.exec.failed",
+    ]
+    assert events[0]["payload"]["instance_name"] == "smoke-001"
+    assert events[0]["payload"]["command"] == "uptime"
+    assert events[0]["payload"]["output"] == "ok"
+    assert events[1]["payload"]["instance_name"] == "smoke-002"
+    assert events[1]["payload"]["error"] == "remote command failed"
 
 
 def test_cli_fleet_check_reports_matching_instance_capabilities():
@@ -318,6 +397,37 @@ def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():
     assert payload["remaining"] == []
 
 
+def test_cli_fleet_down_records_deleted_events(tmp_path):
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    db_path = tmp_path / "state.db"
+
+    code = main(
+        [
+            "fleet",
+            "down",
+            "--name-prefix",
+            "smoke",
+            "--db",
+            str(db_path),
+            "--yes",
+            "--no-wait",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    events = StateStore(db_path).list_events()
+    assert [(event["event_type"], event["payload"]) for event in events] == [
+        (
+            "fleet.down.deleted",
+            {"instance_name": "smoke-001", "output": "deleted smoke-001"},
+        )
+    ]
+
+
 def test_cli_fleet_down_waits_until_matching_instances_are_gone():
     stdout = io.StringIO()
     client = FakeBrevClient()
@@ -380,6 +490,45 @@ def test_cli_fleet_down_returns_two_when_wait_times_out():
     assert code == 2
     payload = json.loads(stdout.getvalue())
     assert payload["remaining"] == ["smoke-001"]
+
+
+def test_cli_fleet_down_records_wait_timeout_events(tmp_path):
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.list_results = [
+        [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}],
+        [{"id": "inst-1", "name": "smoke-001", "status": "DELETING"}],
+    ]
+    db_path = tmp_path / "state.db"
+
+    code = main(
+        [
+            "fleet",
+            "down",
+            "--name-prefix",
+            "smoke",
+            "--db",
+            str(db_path),
+            "--yes",
+            "--timeout-seconds",
+            "0",
+            "--poll-seconds",
+            "0",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    events = StateStore(db_path).list_events()
+    assert [event["event_type"] for event in events] == [
+        "fleet.down.deleted",
+        "fleet.down.wait_timeout",
+    ]
+    assert events[1]["payload"] == {
+        "instance_name": "smoke-001",
+        "remaining": ["smoke-001"],
+    }
 
 
 def test_cli_inventory_refresh_uses_injected_brev_client(tmp_path):

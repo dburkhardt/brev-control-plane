@@ -25,6 +25,16 @@ def test_list_instances_parses_brev_ls_json():
     assert calls == [["brev", "ls", "--json"]]
 
 
+def test_list_instances_parses_current_brev_workspace_envelope():
+    def runner(argv):
+        assert argv == ["brev", "ls", "--json"]
+        return Result(stdout=json.dumps({"workspaces": [{"id": "inst-1", "name": "worker"}]}))
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert client.list_instances() == [{"id": "inst-1", "name": "worker"}]
+
+
 def test_search_cpu_parses_brev_search_cpu_json():
     def runner(argv):
         assert argv == ["brev", "search", "cpu", "--json"]

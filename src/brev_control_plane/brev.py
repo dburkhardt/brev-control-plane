@@ -22,18 +22,25 @@ class BrevClient:
     runner: Callable[[list[str]], CommandResult] | None = None
 
     def list_instances(self) -> list[dict[str, Any]]:
-        return self._run_json(["ls", "--json"])
+        payload = self._run_json_payload(["ls", "--json"])
+        if isinstance(payload, dict) and "workspaces" in payload:
+            payload = payload["workspaces"]
+        return self._expect_json_array(payload)
 
     def search_cpu(self) -> list[dict[str, Any]]:
         return self._run_json(["search", "cpu", "--json"])
 
     def _run_json(self, args: list[str]) -> list[dict[str, Any]]:
+        return self._expect_json_array(self._run_json_payload(args))
+
+    def _run_json_payload(self, args: list[str]) -> Any:
         result = self._run(args)
         try:
-            payload = json.loads(result.stdout)
+            return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise BrevCommandError(f"invalid JSON from brev: {exc}") from exc
 
+    def _expect_json_array(self, payload: Any) -> list[dict[str, Any]]:
         if not isinstance(payload, list):
             raise BrevCommandError("expected brev to return a JSON array")
         if not all(isinstance(item, dict) for item in payload):

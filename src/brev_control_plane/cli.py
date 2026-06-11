@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a command on fleet instances matching a name prefix.",
     )
     fleet_exec.add_argument("--name-prefix", required=True)
+    fleet_exec.add_argument("--require-org")
     fleet_exec.add_argument("--host", action="store_true")
     fleet_exec.add_argument("remote_command", nargs=argparse.REMAINDER)
     fleet_down = fleet_subparsers.add_parser(
@@ -190,10 +191,18 @@ def _fleet_exec(
 ) -> int:
     command = _command_from_remainder(args.remote_command)
     brev_client = client or BrevClient()
+    _require_active_org(brev_client, args.require_org)
     names = _matching_instance_names(brev_client, args.name_prefix)
-    output = brev_client.exec_instances(names, command, host=args.host)
-    _write_json(stdout, {"instances": names, "output": output})
-    return 0
+    results: list[dict[str, Any]] = []
+    for name in names:
+        try:
+            output = brev_client.exec_instance(name, command, host=args.host)
+        except BrevCommandError as exc:
+            results.append({"instance": name, "ok": False, "error": str(exc)})
+        else:
+            results.append({"instance": name, "ok": True, "output": output})
+    _write_json(stdout, {"instances": names, "results": results})
+    return 0 if all(result["ok"] for result in results) else 2
 
 
 def _fleet_down(

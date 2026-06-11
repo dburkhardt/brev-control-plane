@@ -77,6 +77,20 @@ class BrevClient:
         result = self._run(args)
         return result.stdout.strip()
 
+    def exec_instance(
+        self,
+        name: str,
+        command: str,
+        *,
+        host: bool = False,
+    ) -> str:
+        args = ["exec", name]
+        if host:
+            args.append("--host")
+        args.append(command)
+        result = self._run(args)
+        return result.stdout.strip()
+
     def _run_json(self, args: list[str]) -> list[dict[str, Any]]:
         return self._expect_json_array(self._run_json_payload(args))
 

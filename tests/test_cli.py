@@ -1,6 +1,7 @@
 import io
 import json
 
+from brev_control_plane.brev import BrevCommandError
 from brev_control_plane.cli import main
 
 
@@ -10,6 +11,7 @@ class FakeBrevClient:
         self.created = []
         self.deleted = []
         self.exec_calls = []
+        self.exec_outputs = {}
         self.instances = [{"id": "inst-1", "name": "worker", "status": "running"}]
         self.org = "personal"
 
@@ -40,6 +42,13 @@ class FakeBrevClient:
     def exec_instances(self, names, command, *, host=False):
         self.exec_calls.append({"names": names, "command": command, "host": host})
         return f"ran {command}"
+
+    def exec_instance(self, name, command, *, host=False):
+        self.exec_calls.append({"name": name, "command": command, "host": host})
+        output = self.exec_outputs.get(name, f"ran {command} on {name}")
+        if isinstance(output, Exception):
+            raise output
+        return output
 
 
 def test_cli_fleet_plan_outputs_json():
@@ -182,13 +191,52 @@ def test_cli_fleet_exec_runs_command_on_matching_instances():
     assert code == 0
     assert client.exec_calls == [
         {
-            "names": ["smoke-001", "smoke-002"],
+            "name": "smoke-001",
+            "command": "echo hello",
+            "host": False,
+        },
+        {
+            "name": "smoke-002",
             "command": "echo hello",
             "host": False,
         }
     ]
     payload = json.loads(stdout.getvalue())
     assert payload["instances"] == ["smoke-001", "smoke-002"]
+    assert payload["results"] == [
+        {"instance": "smoke-001", "ok": True, "output": "ran echo hello on smoke-001"},
+        {"instance": "smoke-002", "ok": True, "output": "ran echo hello on smoke-002"},
+    ]
+
+
+def test_cli_fleet_exec_reports_each_failed_instance():
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [
+        {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+        {"id": "inst-2", "name": "smoke-002", "status": "RUNNING"},
+    ]
+    client.exec_outputs = {
+        "smoke-001": "ok",
+        "smoke-002": BrevCommandError("remote command failed"),
+    }
+
+    code = main(
+        ["fleet", "exec", "--name-prefix", "smoke", "--host", "--", "uptime"],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    assert client.exec_calls == [
+        {"name": "smoke-001", "command": "uptime", "host": True},
+        {"name": "smoke-002", "command": "uptime", "host": True},
+    ]
+    payload = json.loads(stdout.getvalue())
+    assert payload["results"] == [
+        {"instance": "smoke-001", "ok": True, "output": "ok"},
+        {"instance": "smoke-002", "ok": False, "error": "remote command failed"},
+    ]
 
 
 def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():

@@ -106,6 +106,19 @@ def test_exec_instances_runs_brev_exec_for_names_and_command():
     ]
 
 
+def test_exec_instance_runs_brev_exec_for_one_name_and_command():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return Result(stdout="ran\n")
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert client.exec_instance("smoke-001", "echo hello", host=True) == "ran"
+    assert calls == [["brev", "exec", "smoke-001", "--host", "echo hello"]]
+
+
 def test_active_org_parses_starred_brev_org_ls_output():
     calls = []
 

@@ -374,6 +374,24 @@ def test_cli_fleet_check_reports_matching_instance_capabilities():
     assert "ifconfig.me" in client.exec_calls[0]["command"]
     payload = json.loads(stdout.getvalue())
     assert payload["instances"] == ["smoke-001"]
+    assert payload["results"] == [
+        {
+            "instance": "smoke-001",
+            "ok": True,
+            "check": {
+                "name": "smoke-001",
+                "instance": "remote-host",
+                "egress_ip": "203.0.113.20",
+                "uname": "Linux remote-host",
+                "user": "ubuntu",
+                "docker_path": "/usr/bin/docker",
+                "docker_access": "sudo",
+                "docker_version": "Docker version 25.0.0, build abc",
+                "python3": "Python 3.11.8",
+                "disk_root": "/dev/root 30G 10G 20G 34% /",
+            },
+        }
+    ]
     assert payload["checks"] == [
         {
             "name": "smoke-001",
@@ -388,6 +406,78 @@ def test_cli_fleet_check_reports_matching_instance_capabilities():
             "disk_root": "/dev/root 30G 10G 20G 34% /",
         }
     ]
+
+
+def test_cli_fleet_check_continues_after_failed_instance_and_records_events(tmp_path):
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [
+        {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+        {"id": "inst-2", "name": "smoke-002", "status": "RUNNING"},
+    ]
+    client.exec_outputs = {
+        "smoke-001": BrevCommandError("check failed"),
+        "smoke-002": "\n".join(
+            [
+                "INSTANCE=remote-host-2",
+                "EGRESS_IP=203.0.113.21",
+                "UNAME=Linux remote-host-2",
+                "USER=ubuntu",
+                "DOCKER_PATH=/usr/bin/docker",
+                "DOCKER_DIRECT=Docker version 25.0.0, build abc",
+                "DOCKER_SUDO=Docker version 25.0.0, build abc",
+                "PYTHON3=Python 3.11.8",
+                "DISK_ROOT=/dev/root 30G 10G 20G 34% /",
+            ]
+        ),
+    }
+    db_path = tmp_path / "state.db"
+
+    code = main(
+        [
+            "fleet",
+            "check",
+            "--name-prefix",
+            "smoke",
+            "--db",
+            str(db_path),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    assert [call["name"] for call in client.exec_calls] == ["smoke-001", "smoke-002"]
+    payload = json.loads(stdout.getvalue())
+    assert payload["instances"] == ["smoke-001", "smoke-002"]
+    assert payload["checks"] == [
+        {
+            "name": "smoke-002",
+            "instance": "remote-host-2",
+            "egress_ip": "203.0.113.21",
+            "uname": "Linux remote-host-2",
+            "user": "ubuntu",
+            "docker_path": "/usr/bin/docker",
+            "docker_access": "direct",
+            "docker_version": "Docker version 25.0.0, build abc",
+            "python3": "Python 3.11.8",
+            "disk_root": "/dev/root 30G 10G 20G 34% /",
+        }
+    ]
+    assert payload["results"] == [
+        {"instance": "smoke-001", "ok": False, "error": "check failed"},
+        {"instance": "smoke-002", "ok": True, "check": payload["checks"][0]},
+    ]
+    events = StateStore(db_path).list_events()
+    assert [event["event_type"] for event in events] == [
+        "fleet.check.failed",
+        "fleet.check.completed",
+    ]
+    assert events[0]["payload"] == {
+        "instance_name": "smoke-001",
+        "error": "check failed",
+    }
+    assert events[1]["payload"]["instance_name"] == "smoke-002"
 
 
 def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():
@@ -405,11 +495,12 @@ def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():
         client=client,
     )
 
-    assert code == 2
+    assert code == 0
     assert client.deleted == ["smoke-001", "smoke-002"]
     payload = json.loads(stdout.getvalue())
     assert payload["deleted"] == ["smoke-001", "smoke-002"]
     assert payload["remaining"] == ["smoke-001", "smoke-002"]
+    assert payload["verified_absent"] is False
     assert payload["delete_results"] == [
         {"instance": "smoke-001", "ok": True, "output": "deleted smoke-001"},
         {"instance": "smoke-002", "ok": True, "output": "deleted smoke-002"},
@@ -437,7 +528,7 @@ def test_cli_fleet_down_records_deleted_events(tmp_path):
         client=client,
     )
 
-    assert code == 2
+    assert code == 0
     events = StateStore(db_path).list_events()
     assert [(event["event_type"], event["payload"]) for event in events] == [
         (
@@ -480,6 +571,7 @@ def test_cli_fleet_down_waits_until_matching_instances_are_gone():
     payload = json.loads(stdout.getvalue())
     assert payload["deleted"] == ["smoke-001", "smoke-002"]
     assert payload["remaining"] == []
+    assert payload["verified_absent"] is True
 
 
 def test_cli_fleet_down_returns_two_when_wait_times_out():
@@ -509,6 +601,7 @@ def test_cli_fleet_down_returns_two_when_wait_times_out():
     assert code == 2
     payload = json.loads(stdout.getvalue())
     assert payload["remaining"] == ["smoke-001"]
+    assert payload["verified_absent"] is False
 
 
 def test_cli_fleet_down_attempts_all_deletes_and_reports_failures(tmp_path):
@@ -542,6 +635,7 @@ def test_cli_fleet_down_attempts_all_deletes_and_reports_failures(tmp_path):
     payload = json.loads(stdout.getvalue())
     assert payload["deleted"] == ["smoke-001", "smoke-003"]
     assert payload["remaining"] == ["smoke-001", "smoke-002", "smoke-003"]
+    assert payload["verified_absent"] is False
     assert payload["delete_results"] == [
         {"instance": "smoke-001", "ok": True, "output": "deleted smoke-001"},
         {"instance": "smoke-002", "ok": False, "error": "delete failed"},

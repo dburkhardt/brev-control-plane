@@ -269,19 +269,32 @@ def _fleet_check(
     names = _matching_instance_names(brev_client, args.name_prefix)
     command = build_check_command()
     checks: list[dict[str, str]] = []
+    results: list[dict[str, Any]] = []
     for name in names:
-        output = brev_client.exec_instance(name, command, host=True)
-        report = parse_check_output(output)
-        report["name"] = name
-        checks.append(report)
-        if store is not None:
-            store.record_live_event(
-                "fleet.check.completed",
-                instance_name=name,
-                payload=report,
-            )
-    _write_json(stdout, {"instances": names, "checks": checks})
-    return 0
+        try:
+            output = brev_client.exec_instance(name, command, host=True)
+        except BrevCommandError as exc:
+            error = str(exc)
+            results.append({"instance": name, "ok": False, "error": error})
+            if store is not None:
+                store.record_live_event(
+                    "fleet.check.failed",
+                    instance_name=name,
+                    payload={"error": error},
+                )
+        else:
+            report = parse_check_output(output)
+            report["name"] = name
+            checks.append(report)
+            results.append({"instance": name, "ok": True, "check": report})
+            if store is not None:
+                store.record_live_event(
+                    "fleet.check.completed",
+                    instance_name=name,
+                    payload=report,
+                )
+    _write_json(stdout, {"instances": names, "checks": checks, "results": results})
+    return 0 if all(result["ok"] for result in results) else 2
 
 
 def _fleet_down(
@@ -340,16 +353,19 @@ def _fleet_down(
                     instance_name=name,
                     payload={"remaining": remaining},
                 )
+    verified_absent = not remaining if not args.no_wait else False
     _write_json(
         stdout,
         {
             "deleted": deleted,
             "remaining": remaining,
+            "verified_absent": verified_absent,
             "outputs": outputs,
             "delete_results": delete_results,
         },
     )
-    return 2 if delete_failed or remaining else 0
+    wait_timed_out = not args.no_wait and bool(remaining)
+    return 2 if delete_failed or wait_timed_out else 0
 
 
 def _inventory_refresh(

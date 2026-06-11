@@ -239,6 +239,58 @@ def test_cli_fleet_exec_reports_each_failed_instance():
     ]
 
 
+def test_cli_fleet_check_reports_matching_instance_capabilities():
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [
+        {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+        {"id": "inst-2", "name": "other-001", "status": "RUNNING"},
+    ]
+    client.exec_outputs = {
+        "smoke-001": "\n".join(
+            [
+                "INSTANCE=remote-host",
+                "EGRESS_IP=203.0.113.20",
+                "UNAME=Linux remote-host",
+                "USER=ubuntu",
+                "DOCKER_PATH=/usr/bin/docker",
+                "DOCKER_DIRECT=permission denied",
+                "DOCKER_SUDO=Docker version 25.0.0, build abc",
+                "PYTHON3=Python 3.11.8",
+                "DISK_ROOT=/dev/root 30G 10G 20G 34% /",
+            ]
+        )
+    }
+
+    code = main(
+        ["fleet", "check", "--name-prefix", "smoke"],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert len(client.exec_calls) == 1
+    assert client.exec_calls[0]["name"] == "smoke-001"
+    assert client.exec_calls[0]["host"] is True
+    assert "ifconfig.me" in client.exec_calls[0]["command"]
+    payload = json.loads(stdout.getvalue())
+    assert payload["instances"] == ["smoke-001"]
+    assert payload["checks"] == [
+        {
+            "name": "smoke-001",
+            "instance": "remote-host",
+            "egress_ip": "203.0.113.20",
+            "uname": "Linux remote-host",
+            "user": "ubuntu",
+            "docker_path": "/usr/bin/docker",
+            "docker_access": "sudo",
+            "docker_version": "Docker version 25.0.0, build abc",
+            "python3": "Python 3.11.8",
+            "disk_root": "/dev/root 30G 10G 20G 34% /",
+        }
+    ]
+
+
 def test_cli_fleet_down_deletes_only_matching_instances_with_confirmation():
     stdout = io.StringIO()
     client = FakeBrevClient()

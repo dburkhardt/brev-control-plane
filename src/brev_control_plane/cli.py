@@ -9,6 +9,7 @@ import sys
 from typing import Any, TextIO
 
 from .brev import BrevClient, BrevCommandError
+from .checks import build_check_command, parse_check_output
 from .jobs import JobSpecError, load_job_spec
 from .planner import CpuFilter, PlanError, plan_fleet
 from .state import StateStore
@@ -50,6 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_exec.add_argument("--require-org")
     fleet_exec.add_argument("--host", action="store_true")
     fleet_exec.add_argument("remote_command", nargs=argparse.REMAINDER)
+    fleet_check = fleet_subparsers.add_parser(
+        "check",
+        help="Run generic capability checks on fleet instances.",
+    )
+    fleet_check.add_argument("--name-prefix", required=True)
+    fleet_check.add_argument("--require-org")
+    fleet_check.add_argument("--db")
     fleet_down = fleet_subparsers.add_parser(
         "down",
         help="Delete fleet instances matching a name prefix.",
@@ -98,6 +106,8 @@ def main(
             return _fleet_apply(args, stdout, client)
         if args.command == "fleet" and args.fleet_command == "exec":
             return _fleet_exec(args, stdout, client)
+        if args.command == "fleet" and args.fleet_command == "check":
+            return _fleet_check(args, stdout, client)
         if args.command == "fleet" and args.fleet_command == "down":
             return _fleet_down(args, stdout, client)
         if args.command == "inventory" and args.inventory_command == "refresh":
@@ -203,6 +213,25 @@ def _fleet_exec(
             results.append({"instance": name, "ok": True, "output": output})
     _write_json(stdout, {"instances": names, "results": results})
     return 0 if all(result["ok"] for result in results) else 2
+
+
+def _fleet_check(
+    args: argparse.Namespace,
+    stdout: TextIO,
+    client: BrevClient | None,
+) -> int:
+    brev_client = client or BrevClient()
+    _require_active_org(brev_client, args.require_org)
+    names = _matching_instance_names(brev_client, args.name_prefix)
+    command = build_check_command()
+    checks: list[dict[str, str]] = []
+    for name in names:
+        output = brev_client.exec_instance(name, command, host=True)
+        report = parse_check_output(output)
+        report["name"] = name
+        checks.append(report)
+    _write_json(stdout, {"instances": names, "checks": checks})
+    return 0
 
 
 def _fleet_down(

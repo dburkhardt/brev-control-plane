@@ -193,10 +193,15 @@ def _fleet_apply(
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
     store = _state_store(args.db)
+    existing_names = set(_matching_instance_names_or_empty(brev_client, args.name_prefix))
+    existing_target: list[str] = []
     created: list[str] = []
     outputs: dict[str, str] = {}
     for worker in plan["workers"]:
         name = worker["name"]
+        if name in existing_names:
+            existing_target.append(name)
+            continue
         outputs[name] = brev_client.create_instance(
             name=name,
             instance_type=args.instance_type,
@@ -216,6 +221,7 @@ def _fleet_apply(
         stdout,
         {
             "created": created,
+            "existing": existing_target,
             "instance_type": args.instance_type,
             "outputs": outputs,
         },

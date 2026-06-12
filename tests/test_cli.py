@@ -164,6 +164,39 @@ def test_cli_fleet_apply_creates_named_instances_with_confirmation():
     assert payload["created"] == ["smoke-001", "smoke-002"]
 
 
+def test_cli_fleet_apply_skips_existing_named_instances_when_scaling_up():
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [
+        {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+        {"id": "inst-2", "name": "smoke-002", "status": "RUNNING"},
+    ]
+
+    code = main(
+        [
+            "fleet",
+            "apply",
+            "--workers",
+            "4",
+            "--type",
+            "n2d-highcpu-2",
+            "--name-prefix",
+            "smoke",
+            "--timeout-seconds",
+            "900",
+            "--yes",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert [item["name"] for item in client.created] == ["smoke-003", "smoke-004"]
+    payload = json.loads(stdout.getvalue())
+    assert payload["existing"] == ["smoke-001", "smoke-002"]
+    assert payload["created"] == ["smoke-003", "smoke-004"]
+
+
 def test_cli_fleet_apply_rejects_unexpected_active_org():
     stdout = io.StringIO()
     stderr = io.StringIO()

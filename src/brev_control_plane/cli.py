@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import shlex
@@ -98,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--require-org")
     run.add_argument("--db")
     run.add_argument("--host", action="store_true")
+    run.add_argument("--concurrency", type=int, default=1)
 
     return parser
 
@@ -410,6 +412,8 @@ def _jobs_run(
     spec = load_job_spec(spec_path)
     if spec.artifacts:
         raise JobSpecError("artifact collection is not implemented for jobs run")
+    if args.concurrency <= 0:
+        raise PlanError("concurrency must be positive")
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
     store = _state_store(args.db)
@@ -425,8 +429,7 @@ def _jobs_run(
             remote_dir = f"/tmp/brev-control-plane-job-{run_id}"
             remote_archive = f"{remote_dir}.tar.gz"
 
-        results: list[dict[str, Any]] = []
-        for name in names:
+        def run_one(name: str) -> dict[str, Any]:
             try:
                 if local_archive is not None:
                     brev_client.copy_to_instance(
@@ -444,21 +447,25 @@ def _jobs_run(
                     host=args.host,
                 )
             except BrevCommandError as exc:
-                error = str(exc)
-                results.append({"instance": name, "ok": False, "error": error})
-                if store is not None:
-                    store.record_live_event(
-                        "jobs.run.failed",
-                        instance_name=name,
-                        payload={"command": spec.command, "error": error},
-                    )
-            else:
-                results.append({"instance": name, "ok": True, "output": output})
-                if store is not None:
+                return {"instance": name, "ok": False, "error": str(exc)}
+            return {"instance": name, "ok": True, "output": output}
+
+        with ThreadPoolExecutor(max_workers=min(args.concurrency, len(names))) as executor:
+            results = list(executor.map(run_one, names))
+
+        if store is not None:
+            for result in results:
+                if result["ok"]:
                     store.record_live_event(
                         "jobs.run.completed",
-                        instance_name=name,
-                        payload={"command": spec.command, "output": output},
+                        instance_name=str(result["instance"]),
+                        payload={"command": spec.command, "output": result["output"]},
+                    )
+                else:
+                    store.record_live_event(
+                        "jobs.run.failed",
+                        instance_name=str(result["instance"]),
+                        payload={"command": spec.command, "error": result["error"]},
                     )
 
     _write_json(stdout, {"instances": names, "results": results})

@@ -100,6 +100,7 @@ brev-control-plane jobs run ./job.json \
   --name-prefix worker \
   --require-org personal \
   --db ./fleet.sqlite3 \
+  --concurrency 4 \
   --host
 ```
 

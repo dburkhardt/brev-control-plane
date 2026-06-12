@@ -1,5 +1,7 @@
 import io
 import json
+import threading
+import time
 
 from brev_control_plane.brev import BrevCommandError
 from brev_control_plane.cli import main
@@ -853,4 +855,54 @@ def test_cli_jobs_run_wraps_command_with_timeout_when_runtime_limit_is_set(tmp_p
     assert code == 0
     assert client.exec_calls == [
         {"name": "smoke-001", "command": "timeout 30 bash -lc 'echo hi'", "host": False}
+    ]
+
+
+def test_cli_jobs_run_limits_parallel_instance_execution(tmp_path):
+    job_path = tmp_path / "job.json"
+    job_path.write_text(json.dumps({"command": "echo hi"}), encoding="utf-8")
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [
+        {"id": "inst-1", "name": "smoke-001", "status": "RUNNING"},
+        {"id": "inst-2", "name": "smoke-002", "status": "RUNNING"},
+        {"id": "inst-3", "name": "smoke-003", "status": "RUNNING"},
+    ]
+    lock = threading.Lock()
+    in_flight = 0
+    max_in_flight = 0
+
+    def exec_instance(name, command, *, host=False):
+        nonlocal in_flight, max_in_flight
+        with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        time.sleep(0.03)
+        with lock:
+            in_flight -= 1
+        return f"ran on {name}"
+
+    client.exec_instance = exec_instance
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--concurrency",
+            "2",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert max_in_flight == 2
+    payload = json.loads(stdout.getvalue())
+    assert [result["instance"] for result in payload["results"]] == [
+        "smoke-001",
+        "smoke-002",
+        "smoke-003",
     ]

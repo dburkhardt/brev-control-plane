@@ -858,6 +858,100 @@ def test_cli_jobs_run_wraps_command_with_timeout_when_runtime_limit_is_set(tmp_p
     ]
 
 
+def test_cli_jobs_run_can_execute_under_docker_group(tmp_path):
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps({"command": "docker ps && python run.py", "max_runtime_seconds": 30}),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--docker-group",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert len(client.exec_calls) == 1
+    command = client.exec_calls[0]["command"]
+    assert command.startswith("timeout 30 sg docker -c ")
+    assert "bash -lc" in command
+    assert "docker ps && python run.py" in command
+
+
+def test_cli_jobs_run_retries_transient_bundle_copy_failures(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "test_example.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "python3 -m pytest -q",
+                "bundle": {"source": str(source)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    copy_attempts = 0
+
+    def flaky_copy(local_path, instance_name, remote_path):
+        nonlocal copy_attempts
+        copy_attempts += 1
+        client.copy_calls.append(
+            {
+                "local_path": str(local_path),
+                "instance_name": instance_name,
+                "remote_path": remote_path,
+            }
+        )
+        if copy_attempts == 1:
+            raise BrevCommandError("rpc error: code = Unauthenticated")
+        return f"copied {instance_name}"
+
+    client.copy_to_instance = flaky_copy
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--copy-attempts",
+            "2",
+            "--copy-retry-delay-seconds",
+            "0",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert copy_attempts == 2
+    assert len(client.exec_calls) == 1
+    assert json.loads(stdout.getvalue())["results"] == [
+        {
+            "instance": "smoke-001",
+            "ok": True,
+            "output": client.exec_calls[0]["command"].join(["ran ", " on smoke-001"]),
+        }
+    ]
+
+
 def test_cli_jobs_run_limits_parallel_instance_execution(tmp_path):
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps({"command": "echo hi"}), encoding="utf-8")

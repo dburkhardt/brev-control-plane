@@ -100,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--db")
     run.add_argument("--host", action="store_true")
     run.add_argument("--concurrency", type=int, default=1)
+    run.add_argument("--copy-attempts", type=int, default=1)
+    run.add_argument("--copy-retry-delay-seconds", type=float, default=2.0)
+    run.add_argument(
+        "--docker-group",
+        action="store_true",
+        help="Run the job command through 'sg docker' for hosts whose login shell lacks Docker socket access.",
+    )
 
     return parser
 
@@ -414,6 +421,10 @@ def _jobs_run(
         raise JobSpecError("artifact collection is not implemented for jobs run")
     if args.concurrency <= 0:
         raise PlanError("concurrency must be positive")
+    if args.copy_attempts <= 0:
+        raise PlanError("copy_attempts must be positive")
+    if args.copy_retry_delay_seconds < 0:
+        raise PlanError("copy_retry_delay_seconds must be non-negative")
     brev_client = client or BrevClient()
     _require_active_org(brev_client, args.require_org)
     store = _state_store(args.db)
@@ -432,10 +443,13 @@ def _jobs_run(
         def run_one(name: str) -> dict[str, Any]:
             try:
                 if local_archive is not None:
-                    brev_client.copy_to_instance(
+                    _copy_to_instance_with_retries(
+                        brev_client,
                         local_archive,
                         name,
                         str(remote_archive),
+                        attempts=args.copy_attempts,
+                        delay_seconds=args.copy_retry_delay_seconds,
                     )
                 output = brev_client.exec_instance(
                     name,
@@ -443,6 +457,7 @@ def _jobs_run(
                         spec,
                         remote_archive=remote_archive,
                         remote_dir=remote_dir,
+                        docker_group=args.docker_group,
                     ),
                     host=args.host,
                 )
@@ -470,6 +485,26 @@ def _jobs_run(
 
     _write_json(stdout, {"instances": names, "results": results})
     return 0 if all(result["ok"] for result in results) else 2
+
+
+def _copy_to_instance_with_retries(
+    brev_client: BrevClient,
+    local_archive: Path,
+    name: str,
+    remote_archive: str,
+    *,
+    attempts: int,
+    delay_seconds: float,
+) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            brev_client.copy_to_instance(local_archive, name, remote_archive)
+            return
+        except BrevCommandError:
+            if attempt == attempts:
+                raise
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
 
 
 def _matching_instance_names(
@@ -556,8 +591,9 @@ def _job_remote_command(
     *,
     remote_archive: str | None,
     remote_dir: str | None,
+    docker_group: bool = False,
 ) -> str:
-    command = _job_shell_invocation(spec)
+    command = _job_shell_invocation(spec, docker_group=docker_group)
     if remote_archive is None or remote_dir is None:
         return command
     setup = [
@@ -569,12 +605,14 @@ def _job_remote_command(
     return " && ".join([*setup, command])
 
 
-def _job_shell_invocation(spec: JobSpec) -> str:
+def _job_shell_invocation(spec: JobSpec, *, docker_group: bool = False) -> str:
     env_args = [f"{key}={value}" for key, value in spec.env.items()]
     if env_args:
         command = ["env", *env_args, "bash", "-lc", spec.command]
     else:
         command = ["bash", "-lc", spec.command]
+    if docker_group:
+        command = ["sg", "docker", "-c", shlex.join(command)]
     if spec.max_runtime_seconds is not None:
         command = ["timeout", str(spec.max_runtime_seconds), *command]
     return shlex.join(command)

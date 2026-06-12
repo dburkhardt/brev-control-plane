@@ -80,6 +80,24 @@ def test_parse_check_output_uses_sg_when_session_lacks_docker_group():
     assert report["docker_version"] == "Docker version 29.5.3, build d1c06ef"
 
 
+def test_parse_check_output_prefers_sg_over_sudo_when_both_work():
+    output = "\n".join(
+        [
+            "DOCKER_DIRECT_VERSION=Docker version 29.5.3, build d1c06ef",
+            "DOCKER_DIRECT_API=failed",
+            "DOCKER_SUDO_VERSION=Docker version 29.5.3, build d1c06ef",
+            "DOCKER_SUDO_API=ok",
+            "DOCKER_SG_VERSION=Docker version 29.5.3, build d1c06ef",
+            "DOCKER_SG_API=ok",
+        ]
+    )
+
+    report = parse_check_output(output)
+
+    assert report["docker_access"] == "sg"
+    assert report["docker_version"] == "Docker version 29.5.3, build d1c06ef"
+
+
 def test_parse_check_output_marks_docker_missing_without_version():
     report = parse_check_output(
         "DOCKER_DIRECT_VERSION=\nDOCKER_DIRECT_API=failed\n"

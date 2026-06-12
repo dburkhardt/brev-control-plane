@@ -35,8 +35,8 @@ def parse_check_output(output: str) -> dict[str, str]:
     docker_version = ""
     for access, prefix in (
         ("direct", "DOCKER_DIRECT"),
-        ("sudo", "DOCKER_SUDO"),
         ("sg", "DOCKER_SG"),
+        ("sudo", "DOCKER_SUDO"),
     ):
         version = values.get(f"{prefix}_VERSION", values.get(prefix, ""))
         api = values.get(f"{prefix}_API")

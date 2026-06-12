@@ -11,8 +11,12 @@ printf 'EGRESS_IP=%s\n' "$(curl -fsSL --max-time 10 https://ifconfig.me 2>/dev/n
 printf 'UNAME=%s\n' "$(uname -a 2>/dev/null | head -n 1)"
 printf 'USER=%s\n' "$(id -un 2>/dev/null | head -n 1)"
 printf 'DOCKER_PATH=%s\n' "$(command -v docker 2>/dev/null | head -n 1)"
-printf 'DOCKER_DIRECT=%s\n' "$(timeout 10 docker --version 2>&1 | head -n 1)"
-printf 'DOCKER_SUDO=%s\n' "$(timeout 10 sudo -n docker --version 2>&1 | head -n 1)"
+printf 'DOCKER_DIRECT_VERSION=%s\n' "$(timeout 10 docker --version 2>&1 | head -n 1)"
+printf 'DOCKER_DIRECT_API=%s\n' "$(timeout 10 bash -lc 'docker ps >/dev/null' >/dev/null 2>&1 && echo ok || echo failed)"
+printf 'DOCKER_SUDO_VERSION=%s\n' "$(timeout 10 sudo -n docker --version 2>&1 | head -n 1)"
+printf 'DOCKER_SUDO_API=%s\n' "$(timeout 10 sudo -n docker ps >/dev/null 2>&1 && echo ok || echo failed)"
+printf 'DOCKER_SG_VERSION=%s\n' "$(timeout 10 sg docker -c 'docker --version' 2>&1 | head -n 1)"
+printf 'DOCKER_SG_API=%s\n' "$(timeout 10 sg docker -c 'docker ps >/dev/null' >/dev/null 2>&1 && echo ok || echo failed)"
 printf 'PYTHON3=%s\n' "$(python3 --version 2>&1 | head -n 1)"
 printf 'DISK_ROOT=%s\n' "$(df -h / 2>/dev/null | tail -n 1)"
 """
@@ -27,17 +31,21 @@ def parse_check_output(output: str) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key] = value
 
-    direct = values.get("DOCKER_DIRECT", "")
-    sudo = values.get("DOCKER_SUDO", "")
-    if direct.startswith("Docker version"):
-        docker_access = "direct"
-        docker_version = direct
-    elif sudo.startswith("Docker version"):
-        docker_access = "sudo"
-        docker_version = sudo
-    else:
-        docker_access = "missing"
-        docker_version = ""
+    docker_access = "missing"
+    docker_version = ""
+    for access, prefix in (
+        ("direct", "DOCKER_DIRECT"),
+        ("sudo", "DOCKER_SUDO"),
+        ("sg", "DOCKER_SG"),
+    ):
+        version = values.get(f"{prefix}_VERSION", values.get(prefix, ""))
+        api = values.get(f"{prefix}_API")
+        if api is None:
+            api = "ok" if version.startswith("Docker version") else "failed"
+        if api == "ok" and version.startswith("Docker version"):
+            docker_access = access
+            docker_version = version
+            break
 
     return {
         "instance": values.get("INSTANCE", ""),

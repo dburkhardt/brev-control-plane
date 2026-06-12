@@ -1,7 +1,10 @@
 import io
 import json
+import os
+import tarfile
 import threading
 import time
+from pathlib import Path
 
 from brev_control_plane.brev import BrevCommandError
 from brev_control_plane.cli import main
@@ -17,6 +20,7 @@ class FakeBrevClient:
         self.exec_calls = []
         self.exec_outputs = {}
         self.copy_calls = []
+        self.copy_from_calls = []
         self.instances = [{"id": "inst-1", "name": "worker", "status": "running"}]
         self.list_results = None
         self.org = "personal"
@@ -72,6 +76,16 @@ class FakeBrevClient:
             }
         )
         return f"copied {instance_name}"
+
+    def copy_from_instance(self, instance_name, remote_path, local_path):
+        self.copy_from_calls.append(
+            {
+                "instance_name": instance_name,
+                "remote_path": remote_path,
+                "local_path": str(local_path),
+            }
+        )
+        return f"copied from {instance_name}"
 
 
 def test_cli_fleet_plan_outputs_json():
@@ -813,7 +827,7 @@ def test_cli_jobs_run_copies_bundle_and_executes_command(tmp_path):
     ]
 
 
-def test_cli_jobs_run_rejects_artifacts_until_collection_is_implemented(tmp_path):
+def test_cli_jobs_run_requires_bundle_when_artifacts_are_requested(tmp_path):
     job_path = tmp_path / "job.json"
     job_path.write_text(
         json.dumps({"command": "echo hi", "artifacts": ["reports/"]}),
@@ -833,7 +847,544 @@ def test_cli_jobs_run_rejects_artifacts_until_collection_is_implemented(tmp_path
 
     assert code == 2
     assert client.exec_calls == []
-    assert "artifact collection is not implemented" in json.loads(stderr.getvalue())["error"]
+    assert "artifact collection requires a bundle" in json.loads(stderr.getvalue())["error"]
+
+
+def test_cli_jobs_run_collects_requested_artifacts_after_success(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/result.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+    db_path = tmp_path / "events.sqlite3"
+
+    def copy_artifact_archive(instance_name, remote_path, local_path):
+        client.copy_from_calls.append(
+            {
+                "instance_name": instance_name,
+                "remote_path": remote_path,
+                "local_path": str(local_path),
+            }
+        )
+        local_archive = Path(local_path)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+        source_file = tmp_path / "result.txt"
+        source_file.write_text("artifact payload\n", encoding="utf-8")
+        with tarfile.open(local_archive, "w:gz") as archive:
+            archive.add(source_file, arcname="reports/result.txt")
+        return f"copied from {instance_name}"
+
+    client.copy_from_instance = copy_artifact_archive
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--db",
+            str(db_path),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    remote_dir = client.copy_calls[0]["remote_path"].removesuffix(".tar.gz")
+    assert len(client.exec_calls) == 3
+    assert "tar -czf" in client.exec_calls[1]["command"]
+    assert f"cd {remote_dir}" in client.exec_calls[1]["command"]
+    assert "reports/result.txt" in client.exec_calls[1]["command"]
+    local_archive = Path(client.copy_from_calls[0]["local_path"])
+    archive_dir = local_archive.parent
+    run_dir = archive_dir.parent
+    local_instance_dir = run_dir / "smoke-001"
+    assert run_dir.parent == artifact_dir
+    assert local_instance_dir.name == "smoke-001"
+    assert archive_dir.name == "_archives"
+    assert local_instance_dir.parent == run_dir
+    assert client.copy_from_calls == [
+        {
+            "instance_name": "smoke-001",
+            "remote_path": f"{remote_dir}.artifacts.tar.gz",
+            "local_path": str(local_archive),
+        }
+    ]
+    extracted = local_instance_dir / "reports" / "result.txt"
+    assert extracted.read_text(encoding="utf-8") == "artifact payload\n"
+    assert local_archive.exists()
+    payload = json.loads(stdout.getvalue())
+    assert payload["results"] == [
+        {
+            "instance": "smoke-001",
+            "ok": True,
+            "output": "ok",
+            "run_id": run_dir.name,
+            "artifacts": [
+                {
+                    "path": "reports/result.txt",
+                    "local_path": str(extracted),
+                }
+            ],
+            "artifact_archive": {
+                "remote_path": f"{remote_dir}.artifacts.tar.gz",
+                "local_path": str(local_archive),
+            },
+        }
+    ]
+    events = StateStore(db_path).list_events()
+    assert events[0]["event_type"] == "jobs.run.completed"
+    assert events[0]["payload"]["run_id"] == run_dir.name
+    assert events[0]["payload"]["artifact_dir"] == str(artifact_dir)
+    assert events[0]["payload"]["artifacts_requested"] == ["reports/result.txt"]
+    assert events[0]["payload"]["artifacts"] == payload["results"][0]["artifacts"]
+
+
+def test_cli_jobs_run_keeps_archive_metadata_when_artifact_name_matches_archive(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["_artifacts.tar.gz"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+
+    def copy_artifact_archive(instance_name, remote_path, local_path):
+        client.copy_from_calls.append(
+            {
+                "instance_name": instance_name,
+                "remote_path": remote_path,
+                "local_path": str(local_path),
+            }
+        )
+        local_archive = Path(local_path)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+        source_file = tmp_path / "payload.tar.gz"
+        source_file.write_text("not the copied archive\n", encoding="utf-8")
+        with tarfile.open(local_archive, "w:gz") as archive:
+            archive.add(source_file, arcname="_artifacts.tar.gz")
+        return f"copied from {instance_name}"
+
+    client.copy_from_instance = copy_artifact_archive
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    result = json.loads(stdout.getvalue())["results"][0]
+    archive_path = Path(result["artifact_archive"]["local_path"])
+    artifact_path = Path(result["artifacts"][0]["local_path"])
+    assert archive_path.parent.name == "_archives"
+    assert artifact_path.name == "_artifacts.tar.gz"
+    assert archive_path != artifact_path
+    assert archive_path.exists()
+    assert artifact_path.read_text(encoding="utf-8") == "not the copied archive\n"
+
+
+def test_cli_jobs_run_uses_safe_local_instance_directory_names(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/result.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-../001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-../001": "ok"}
+
+    def copy_artifact_archive(instance_name, remote_path, local_path):
+        local_archive = Path(local_path)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+        source_file = tmp_path / "result.txt"
+        source_file.write_text("artifact payload\n", encoding="utf-8")
+        with tarfile.open(local_archive, "w:gz") as archive:
+            archive.add(source_file, arcname="reports/result.txt")
+        return f"copied from {instance_name}"
+
+    client.copy_from_instance = copy_artifact_archive
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    result = json.loads(stdout.getvalue())["results"][0]
+    artifact_path = Path(result["artifacts"][0]["local_path"])
+    assert artifact_path.is_relative_to(artifact_dir)
+    assert "smoke-.._001" in artifact_path.parts
+
+
+def test_cli_jobs_run_rejects_unsafe_tar_members(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+
+    def copy_artifact_archive(instance_name, remote_path, local_path):
+        local_archive = Path(local_path)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+        fifo_path = tmp_path / "fifo"
+        os.mkfifo(fifo_path)
+        with tarfile.open(local_archive, "w:gz") as archive:
+            archive.add(fifo_path, arcname="reports/fifo")
+        return f"copied from {instance_name}"
+
+    client.copy_from_instance = copy_artifact_archive
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    result = json.loads(stdout.getvalue())["results"][0]
+    assert result["ok"] is False
+    assert "unsafe artifact archive member" in result["error"]
+
+
+def test_cli_jobs_run_rejects_unrequested_tar_members(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/result.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+
+    def copy_artifact_archive(instance_name, remote_path, local_path):
+        local_archive = Path(local_path)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+        requested = tmp_path / "result.txt"
+        requested.write_text("artifact payload\n", encoding="utf-8")
+        extra = tmp_path / "secrets.env"
+        extra.write_text("TOKEN=secret\n", encoding="utf-8")
+        with tarfile.open(local_archive, "w:gz") as archive:
+            archive.add(requested, arcname="reports/result.txt")
+            archive.add(extra, arcname="secrets.env")
+        return f"copied from {instance_name}"
+
+    client.copy_from_instance = copy_artifact_archive
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    result = json.loads(stdout.getvalue())["results"][0]
+    assert result["ok"] is False
+    assert "unrequested artifact archive member" in result["error"]
+    assert "secrets.env" in result["error"]
+
+
+def test_cli_jobs_run_rejects_windows_style_tar_members(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+
+    def copy_artifact_archive(instance_name, remote_path, local_path):
+        local_archive = Path(local_path)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+        source_file = tmp_path / "result.txt"
+        source_file.write_text("artifact payload\n", encoding="utf-8")
+        with tarfile.open(local_archive, "w:gz") as archive:
+            archive.add(source_file, arcname=r"reports\result.txt")
+        return f"copied from {instance_name}"
+
+    client.copy_from_instance = copy_artifact_archive
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    result = json.loads(stdout.getvalue())["results"][0]
+    assert result["ok"] is False
+    assert "unsafe artifact archive member" in result["error"]
+
+
+def test_cli_jobs_run_reports_local_artifact_filesystem_failures(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "not-a-directory"
+    artifact_dir.write_text("blocking file\n", encoding="utf-8")
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/result.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    result = json.loads(stdout.getvalue())["results"][0]
+    assert result["ok"] is False
+    assert result["output"] == "ok"
+    assert "failed to prepare local artifact directory" in result["error"]
+    assert str(artifact_dir) in result["error"]
+
+
+def test_cli_jobs_run_fails_when_requested_artifact_is_missing(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+
+    def exec_instance(name, command, *, host=False):
+        client.exec_calls.append({"name": name, "command": command, "host": host})
+        if "tar -czf" in command:
+            raise BrevCommandError("tar: reports: Cannot stat")
+        return client.exec_outputs[name]
+
+    client.exec_instance = exec_instance
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 2
+    payload = json.loads(stdout.getvalue())
+    result = payload["results"][0]
+    assert result["instance"] == "smoke-001"
+    assert result["ok"] is False
+    assert result["output"] == "ok"
+    assert "failed to archive requested artifacts" in result["error"]
+    assert "reports/" in result["error"]
+    assert "tar: reports: Cannot stat" in result["error"]
+
+
+def test_cli_jobs_run_cleans_remote_artifact_archive_after_copy(tmp_path):
+    source = tmp_path / "example-project"
+    source.mkdir()
+    (source / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    job_path = tmp_path / "job.json"
+    job_path.write_text(
+        json.dumps(
+            {
+                "command": "./run.sh",
+                "bundle": {"source": str(source)},
+                "artifacts": ["reports/result.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+    client.exec_outputs = {"smoke-001": "ok"}
+
+    def copy_artifact_archive(instance_name, remote_path, local_path):
+        local_archive = Path(local_path)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+        source_file = tmp_path / "result.txt"
+        source_file.write_text("artifact payload\n", encoding="utf-8")
+        with tarfile.open(local_archive, "w:gz") as archive:
+            archive.add(source_file, arcname="reports/result.txt")
+        return f"copied from {instance_name}"
+
+    client.copy_from_instance = copy_artifact_archive
+
+    code = main(
+        [
+            "jobs",
+            "run",
+            str(job_path),
+            "--name-prefix",
+            "smoke",
+            "--artifact-dir",
+            str(artifact_dir),
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    remote_archive = json.loads(stdout.getvalue())["results"][0]["artifact_archive"]["remote_path"]
+    assert client.exec_calls[-1] == {
+        "name": "smoke-001",
+        "command": f"rm -f {remote_archive}",
+        "host": False,
+    }
 
 
 def test_cli_jobs_run_wraps_command_with_timeout_when_runtime_limit_is_set(tmp_path):

@@ -139,6 +139,25 @@ def test_copy_to_instance_runs_brev_copy_to_remote_path(tmp_path):
     ]
 
 
+def test_copy_from_instance_runs_brev_copy_from_remote_path(tmp_path):
+    calls = []
+    local_path = tmp_path / "artifacts"
+
+    def runner(argv):
+        calls.append(argv)
+        return Result(stdout="copied\n")
+
+    client = BrevClient(binary="brev", runner=runner)
+
+    assert (
+        client.copy_from_instance("smoke-001", "/tmp/job/output", local_path)
+        == "copied"
+    )
+    assert calls == [
+        ["brev", "copy", "smoke-001:/tmp/job/output", str(local_path)]
+    ]
+
+
 def test_active_org_parses_starred_brev_org_ls_output():
     calls = []
 

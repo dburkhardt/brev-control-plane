@@ -22,6 +22,26 @@ def test_validate_job_spec_accepts_minimal_shell_job():
     assert spec.bundle is None
 
 
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        "",
+        "/tmp/output",
+        ".",
+        "./",
+        "./.",
+        "..",
+        "../output",
+        "logs/../../secret",
+        "C:/tmp/output",
+        r"C:\tmp\output",
+    ],
+)
+def test_validate_job_spec_rejects_unsafe_artifact_paths(artifact):
+    with pytest.raises(JobSpecError, match="artifact paths must be relative"):
+        validate_job_spec({"command": "echo hi", "artifacts": [artifact]})
+
+
 def test_validate_job_spec_accepts_bundle_object():
     spec = validate_job_spec(
         {

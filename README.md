@@ -20,7 +20,8 @@ Implemented commands:
   then waits for cleanup unless `--no-wait` is set.
 - `inventory refresh` records `brev ls --json` output in a local SQLite database.
 - `jobs validate` validates a generic shell-job JSON spec.
-- `jobs run` copies an optional source bundle and runs a generic shell-job spec.
+- `jobs run` copies an optional source bundle, runs a generic shell-job spec,
+  and can collect requested artifacts from bundle-backed jobs.
 
 Safety defaults:
 
@@ -101,6 +102,7 @@ brev-control-plane jobs run ./job.json \
   --require-org personal \
   --db ./fleet.sqlite3 \
   --concurrency 4 \
+  --artifact-dir /tmp/brev-control-plane-artifacts \
   --host
 ```
 
@@ -143,13 +145,20 @@ Example `job.json`:
       "dist"
     ]
   },
+  "artifacts": [
+    "reports/",
+    "logs/job.log"
+  ],
   "max_runtime_seconds": 3600
 }
 ```
 
-`jobs validate` accepts an `artifacts` array in job specs, but `jobs run`
-currently rejects artifact collection because copy-back support is not
-implemented yet.
+Artifact paths are relative to the remote job working directory created from the
+bundle. `jobs validate` rejects unsafe artifact entries such as absolute paths,
+empty strings, `.`, `..`, Windows drive paths, backslash paths, and parent
+traversal. `jobs run` requires a bundle when artifacts are requested, archives
+the requested paths on the remote machine, and extracts them locally under
+`--artifact-dir/<run-id>/<instance-name>/`.
 
 ## Development
 

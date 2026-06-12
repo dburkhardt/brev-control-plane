@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
@@ -60,6 +60,8 @@ def validate_job_spec(payload: Any) -> JobSpec:
         raise JobSpecError("artifacts must be an array")
     if not all(isinstance(item, str) for item in artifacts):
         raise JobSpecError("artifacts must be strings")
+    for item in artifacts:
+        _validate_artifact_path(item)
 
     max_runtime_seconds = payload.get("max_runtime_seconds")
     if max_runtime_seconds is not None and not _is_positive_int(max_runtime_seconds):
@@ -80,3 +82,18 @@ def validate_job_spec(payload: Any) -> JobSpec:
 
 def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _validate_artifact_path(path: str) -> None:
+    stripped = path.strip()
+    if not stripped:
+        raise JobSpecError("artifact paths must be relative and non-empty")
+    artifact_path = PurePosixPath(stripped)
+    if (
+        artifact_path.is_absolute()
+        or not artifact_path.parts
+        or "\\" in stripped
+        or PureWindowsPath(stripped).drive
+        or ".." in artifact_path.parts
+    ):
+        raise JobSpecError("artifact paths must be relative and non-empty")

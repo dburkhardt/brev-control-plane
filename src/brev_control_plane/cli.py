@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import shlex
 import shutil
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -102,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--concurrency", type=int, default=1)
     run.add_argument("--copy-attempts", type=int, default=1)
     run.add_argument("--copy-retry-delay-seconds", type=float, default=2.0)
+    run.add_argument(
+        "--artifact-dir",
+        default="/tmp/brev-control-plane-artifacts",
+        help="Local directory for artifacts collected by jobs run.",
+    )
     run.add_argument(
         "--docker-group",
         action="store_true",
@@ -417,8 +424,8 @@ def _jobs_run(
 ) -> int:
     spec_path = Path(args.path)
     spec = load_job_spec(spec_path)
-    if spec.artifacts:
-        raise JobSpecError("artifact collection is not implemented for jobs run")
+    if spec.artifacts and spec.bundle is None:
+        raise JobSpecError("artifact collection requires a bundle")
     if args.concurrency <= 0:
         raise PlanError("concurrency must be positive")
     if args.copy_attempts <= 0:
@@ -430,6 +437,8 @@ def _jobs_run(
     store = _state_store(args.db)
     names = _matching_instance_names(brev_client, args.name_prefix)
     run_id = uuid.uuid4().hex
+    artifact_dir = Path(args.artifact_dir)
+    artifact_run_dir = artifact_dir / run_id
 
     with tempfile.TemporaryDirectory() as temp_dir:
         local_archive: Path | None = None
@@ -461,9 +470,46 @@ def _jobs_run(
                     ),
                     host=args.host,
                 )
+                artifacts = []
+                if spec.artifacts:
+                    if remote_dir is None:
+                        raise JobSpecError("artifact collection requires a bundle")
             except BrevCommandError as exc:
                 return {"instance": name, "ok": False, "error": str(exc)}
-            return {"instance": name, "ok": True, "output": output}
+            if spec.artifacts:
+                try:
+                    collected = _collect_artifacts_with_retries(
+                        brev_client,
+                        name,
+                        spec.artifacts,
+                        remote_dir=str(remote_dir),
+                        artifact_run_dir=artifact_run_dir,
+                        host=args.host,
+                        attempts=args.copy_attempts,
+                        delay_seconds=args.copy_retry_delay_seconds,
+                    )
+                except BrevCommandError as exc:
+                    return {
+                        "instance": name,
+                        "ok": False,
+                        "output": output,
+                        "run_id": run_id,
+                        "error": str(exc),
+                    }
+                artifacts = collected["artifacts"]
+                return {
+                    "instance": name,
+                    "ok": True,
+                    "output": output,
+                    "run_id": run_id,
+                    "artifacts": artifacts,
+                    "artifact_archive": collected["archive"],
+                }
+            return {
+                "instance": name,
+                "ok": True,
+                "output": output,
+            }
 
         with ThreadPoolExecutor(max_workers=min(args.concurrency, len(names))) as executor:
             results = list(executor.map(run_one, names))
@@ -474,13 +520,23 @@ def _jobs_run(
                     store.record_live_event(
                         "jobs.run.completed",
                         instance_name=str(result["instance"]),
-                        payload={"command": spec.command, "output": result["output"]},
+                        payload=_job_event_payload(
+                            spec,
+                            result,
+                            run_id=run_id,
+                            artifact_dir=artifact_dir,
+                        ),
                     )
                 else:
                     store.record_live_event(
                         "jobs.run.failed",
                         instance_name=str(result["instance"]),
-                        payload={"command": spec.command, "error": result["error"]},
+                        payload=_job_event_payload(
+                            spec,
+                            result,
+                            run_id=run_id,
+                            artifact_dir=artifact_dir,
+                        ),
                     )
 
     _write_json(stdout, {"instances": names, "results": results})
@@ -505,6 +561,226 @@ def _copy_to_instance_with_retries(
                 raise
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
+
+
+def _collect_artifacts_with_retries(
+    brev_client: BrevClient,
+    name: str,
+    artifacts: list[str],
+    *,
+    remote_dir: str,
+    artifact_run_dir: Path,
+    host: bool,
+    attempts: int,
+    delay_seconds: float,
+) -> dict[str, Any]:
+    remote_archive = f"{remote_dir}.artifacts.tar.gz"
+    local_instance_name = _safe_local_instance_name(name)
+    local_instance_dir = artifact_run_dir / local_instance_name
+    local_archive = artifact_run_dir / "_archives" / f"{local_instance_name}.tar.gz"
+    try:
+        local_instance_dir.mkdir(parents=True, exist_ok=True)
+        local_archive.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BrevCommandError(
+            "failed to prepare local artifact directory "
+            f"destination={local_instance_dir} archive={local_archive}: {exc}"
+        ) from exc
+
+    try:
+        _archive_remote_artifacts(
+            brev_client,
+            name,
+            artifacts,
+            remote_dir=remote_dir,
+            remote_archive=remote_archive,
+            host=host,
+        )
+        _copy_from_instance_with_retries(
+            brev_client,
+            name,
+            remote_archive,
+            local_archive,
+            attempts=attempts,
+            delay_seconds=delay_seconds,
+        )
+        _extract_tar_safely(local_archive, local_instance_dir, artifacts)
+    finally:
+        _cleanup_remote_artifact_archive(
+            brev_client,
+            name,
+            remote_archive=remote_archive,
+            host=host,
+        )
+
+    return {
+        "archive": {
+            "remote_path": remote_archive,
+            "local_path": str(local_archive),
+        },
+        "artifacts": [
+            {
+                "path": artifact,
+                "local_path": str(local_instance_dir / _local_artifact_path(artifact)),
+            }
+            for artifact in artifacts
+        ],
+    }
+
+
+def _archive_remote_artifacts(
+    brev_client: BrevClient,
+    name: str,
+    artifacts: list[str],
+    *,
+    remote_dir: str,
+    remote_archive: str,
+    host: bool,
+) -> None:
+    artifact_args = " ".join(shlex.quote(artifact) for artifact in artifacts)
+    command = " && ".join(
+        [
+            f"cd {shlex.quote(remote_dir)}",
+            f"tar -czf {shlex.quote(remote_archive)} -- {artifact_args}",
+        ]
+    )
+    try:
+        brev_client.exec_instance(name, command, host=host)
+    except BrevCommandError as exc:
+        raise BrevCommandError(
+            "failed to archive requested artifacts "
+            f"{artifacts!r}: remote_dir={remote_dir} "
+            f"remote_archive={remote_archive}: {exc}"
+        ) from exc
+
+
+def _copy_from_instance_with_retries(
+    brev_client: BrevClient,
+    name: str,
+    remote_path: str,
+    local_path: Path,
+    *,
+    attempts: int,
+    delay_seconds: float,
+) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            brev_client.copy_from_instance(name, remote_path, local_path)
+            return
+        except BrevCommandError as exc:
+            if attempt == attempts:
+                raise BrevCommandError(
+                    "failed to copy artifact archive "
+                    f"remote_path={remote_path} local_path={local_path} "
+                    f"attempts={attempts}: {exc}"
+                ) from exc
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+
+def _cleanup_remote_artifact_archive(
+    brev_client: BrevClient,
+    name: str,
+    *,
+    remote_archive: str,
+    host: bool,
+) -> None:
+    try:
+        brev_client.exec_instance(
+            name,
+            f"rm -f {shlex.quote(remote_archive)}",
+            host=host,
+        )
+    except BrevCommandError:
+        pass
+
+
+def _safe_local_instance_name(name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+    sanitized = sanitized.replace("/", "_").replace("\\", "_")
+    if sanitized in {"", ".", ".."}:
+        return "instance"
+    return sanitized
+
+
+def _local_artifact_path(artifact: str) -> Path:
+    return Path(*PurePosixPath(artifact).parts)
+
+
+def _extract_tar_safely(
+    archive_path: Path,
+    destination: Path,
+    requested_artifacts: list[str],
+) -> None:
+    requested = [_artifact_prefix(artifact) for artifact in requested_artifacts]
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive.getmembers():
+                member_path = PurePosixPath(member.name)
+                if (
+                    member_path.is_absolute()
+                    or not member_path.parts
+                    or "\\" in member.name
+                    or PureWindowsPath(member.name).drive
+                    or ".." in member_path.parts
+                    or member.issym()
+                    or member.islnk()
+                    or not (member.isfile() or member.isdir())
+                ):
+                    raise BrevCommandError(
+                        f"unsafe artifact archive member: {member.name!r}"
+                    )
+                if not any(_archive_member_matches(member.name, item) for item in requested):
+                    raise BrevCommandError(
+                        f"unrequested artifact archive member: {member.name!r}"
+                    )
+            archive.extractall(destination)
+    except tarfile.TarError as exc:
+        raise BrevCommandError(f"failed to extract artifact archive {archive_path}: {exc}") from exc
+    except OSError as exc:
+        raise BrevCommandError(
+            f"failed to extract artifact archive {archive_path} into {destination}: {exc}"
+        ) from exc
+
+
+def _artifact_prefix(artifact: str) -> tuple[str, bool]:
+    stripped = artifact.strip("/")
+    return stripped, artifact.endswith("/")
+
+
+def _archive_member_matches(member_name: str, requested: tuple[str, bool]) -> bool:
+    requested_path, is_directory = requested
+    member = member_name.rstrip("/")
+    if is_directory:
+        return member == requested_path or member.startswith(f"{requested_path}/")
+    return member == requested_path
+
+
+def _job_event_payload(
+    spec: JobSpec,
+    result: dict[str, Any],
+    *,
+    run_id: str,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"command": spec.command}
+    if "output" in result:
+        payload["output"] = result["output"]
+    if "error" in result:
+        payload["error"] = result["error"]
+    if spec.artifacts:
+        payload.update(
+            {
+                "run_id": run_id,
+                "artifact_dir": str(artifact_dir),
+                "artifacts_requested": list(spec.artifacts),
+            }
+        )
+        if "artifacts" in result:
+            payload["artifacts"] = result["artifacts"]
+        if "artifact_archive" in result:
+            payload["artifact_archive"] = result["artifact_archive"]
+    return payload
 
 
 def _matching_instance_names(

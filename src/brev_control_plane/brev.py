@@ -103,6 +103,17 @@ class BrevClient:
         )
         return result.stdout.strip()
 
+    def copy_from_instance(
+        self,
+        instance_name: str,
+        remote_path: str,
+        local_path: str | Path,
+    ) -> str:
+        result = self._run(
+            ["copy", f"{instance_name}:{remote_path}", str(local_path)]
+        )
+        return result.stdout.strip()
+
     def _run_json(self, args: list[str]) -> list[dict[str, Any]]:
         return self._expect_json_array(self._run_json_payload(args))
 

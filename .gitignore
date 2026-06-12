@@ -11,4 +11,6 @@ dist/
 *.db
 *.sqlite
 *.sqlite3
+artifacts/
+.brev-control-plane-artifacts/
 .DS_Store

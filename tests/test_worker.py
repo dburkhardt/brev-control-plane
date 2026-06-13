@@ -2,6 +2,7 @@ import hashlib
 import json
 import sys
 import threading
+import textwrap
 import urllib.request
 
 from brev_control_plane.queue_protocol import QueueJob
@@ -120,6 +121,86 @@ def test_worker_reports_failure_when_subprocess_times_out(tmp_path):
         job = store.list_jobs()[0]
         assert job["status"] == "failed"
         assert "timed out" in job["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_worker_timeout_with_partial_bytes_output_is_json_serializable(
+    monkeypatch, tmp_path
+):
+    from subprocess import TimeoutExpired
+
+    from brev_control_plane import worker
+
+    def fake_run(*args, **kwargs):
+        raise TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs["timeout"],
+            output=b"partial stdout",
+            stderr=b"partial stderr",
+        )
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    result = worker._run_job(
+        QueueJob(
+            command=f"{sys.executable} -c \"print('never')\"",
+            experiment_id="exp-a",
+            max_runtime_seconds=1,
+        ),
+        tmp_path,
+    )
+
+    json.dumps(result)
+    assert result["ok"] is False
+    assert result["stdout"] == "partial stdout"
+    assert result["stderr"] == "partial stderr"
+
+
+def test_worker_heartbeats_during_long_running_job(tmp_path):
+    server, store, base_url = _server(tmp_path)
+    try:
+        script = tmp_path / "long_job.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""
+                import urllib.request
+                import time
+                from pathlib import Path
+
+                time.sleep(1.2)
+                request = urllib.request.Request(
+                    {base_url + '/api/v1/status'!r},
+                    headers={{"Authorization": "Bearer secret-token"}},
+                )
+                urllib.request.urlopen(request, timeout=5).read()
+                Path("out.txt").write_text("ok")
+                """
+            ),
+            encoding="utf-8",
+        )
+        store.submit_job(
+            QueueJob(
+                command=f"{sys.executable} {script}",
+                experiment_id="exp-a",
+                max_attempts=1,
+                max_runtime_seconds=5,
+                output_paths=["out.txt"],
+            )
+        )
+
+        assert run_worker_once(
+            server_url=base_url,
+            token="secret-token",
+            work_dir=tmp_path / "work",
+            worker_id="worker-1",
+            lease_seconds=1,
+        ) is True
+
+        job = store.list_jobs()[0]
+        assert job["status"] == "completed"
+        assert job["worker_id"] == "worker-1"
     finally:
         server.shutdown()
         server.server_close()

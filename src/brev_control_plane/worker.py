@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 from typing import Any
 import urllib.error
@@ -30,7 +31,18 @@ def run_worker_once(
         return False
     job_dir = Path(work_dir) / lease.job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    result = _run_job(lease.job, job_dir)
+    stop_heartbeat = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_lease,
+        args=(client, lease, lease_seconds, stop_heartbeat),
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        result = _run_job(lease.job, job_dir)
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=1.0)
     if result["ok"]:
         client.complete(
             job_id=lease.job_id,
@@ -111,6 +123,23 @@ class QueueClient:
                 "returncode": returncode,
                 "stderr": stderr,
                 "stdout": stdout,
+            },
+        )
+
+    def heartbeat(
+        self,
+        *,
+        job_id: str,
+        lease_id: str,
+        lease_seconds: int,
+    ) -> None:
+        self._request(
+            "POST",
+            "/api/v1/heartbeat",
+            {
+                "job_id": job_id,
+                "lease_id": lease_id,
+                "lease_seconds": lease_seconds,
             },
         )
 
@@ -207,8 +236,8 @@ def _run_job(job: QueueJob, job_dir: Path) -> dict[str, Any]:
         return {
             "error": f"command timed out after {job.max_runtime_seconds} seconds",
             "ok": False,
-            "stderr": exc.stderr or "",
-            "stdout": exc.stdout or "",
+            "stderr": _stream_text(exc.stderr),
+            "stdout": _stream_text(exc.stdout),
         }
 
     artifacts: list[dict[str, Any]] = []
@@ -239,6 +268,32 @@ def _run_job(job: QueueJob, job_dir: Path) -> dict[str, Any]:
         "stderr": completed.stderr,
         "stdout": completed.stdout,
     }
+
+
+def _heartbeat_lease(
+    client: QueueClient,
+    lease: QueueLease,
+    lease_seconds: int,
+    stop: threading.Event,
+) -> None:
+    interval = min(30.0, max(0.1, lease_seconds / 3))
+    while not stop.wait(interval):
+        try:
+            client.heartbeat(
+                job_id=lease.job_id,
+                lease_id=lease.lease_id,
+                lease_seconds=lease_seconds,
+            )
+        except Exception:
+            pass
+
+
+def _stream_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def _hash_output_path(job_dir: Path, output_path: str) -> list[dict[str, Any]]:

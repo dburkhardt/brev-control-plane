@@ -2,6 +2,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 from brev_control_plane.queue_protocol import QueueJob
 from brev_control_plane.queue_server import create_queue_server
@@ -158,6 +159,42 @@ def test_queue_server_filters_jobs_by_id_and_experiment_id(tmp_path):
         assert status == 200
         assert body["ok"] is True
         assert [job["id"] for job in body["jobs"]] == [first_job_id]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_queue_server_status_sweeps_expired_leases(tmp_path):
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    store.submit_job(
+        QueueJob(command="echo stale", experiment_id="exp-a", max_attempts=1),
+        now=now,
+    )
+    lease = store.lease_next(
+        "worker-1",
+        lease_seconds=1,
+        now=now,
+    )
+    assert lease is not None
+    server = create_queue_server("127.0.0.1", 0, store=store, token="secret-token")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        status, body = _request_json(
+            base_url,
+            "GET",
+            "/api/v1/status",
+            token="secret-token",
+        )
+
+        assert status == 200
+        assert body["ok"] is True
+        assert body["status"]["counts"] == {"failed": 1}
+        job = store.list_jobs()[0]
+        assert job["status"] == "failed"
+        assert job["completed_at"] != (now + timedelta(seconds=1)).isoformat()
     finally:
         server.shutdown()
         server.server_close()

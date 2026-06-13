@@ -66,9 +66,11 @@ class _QueueHandler(BaseHTTPRequestHandler):
 
     def _handle_get(self, path: str, query: dict[str, list[str]]) -> None:
         if path == "/api/v1/status":
+            self.server.store.requeue_expired()
             self._write_json(200, {"ok": True, "status": self.server.store.status()})
             return
         if path == "/api/v1/jobs":
+            self.server.store.requeue_expired()
             experiment_values = query.get("experiment_id")
             experiment_id = experiment_values[0] if experiment_values else None
             id_values = query.get("id")
@@ -92,6 +94,7 @@ class _QueueHandler(BaseHTTPRequestHandler):
             self._write_json(200, {"job_id": job_id, "ok": True})
             return
         if path == "/api/v1/leases":
+            self.server.store.requeue_expired()
             lease = self.server.store.lease_next(
                 _required_string(payload, "worker_id"),
                 lease_seconds=_required_positive_int(payload, "lease_seconds"),

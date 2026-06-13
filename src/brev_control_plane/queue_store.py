@@ -188,7 +188,6 @@ class QueueStore:
                 UPDATE jobs
                 SET status = 'completed',
                     lease_id = NULL,
-                    worker_id = NULL,
                     lease_expires_at = NULL,
                     returncode = ?,
                     stdout = ?,
@@ -238,7 +237,6 @@ class QueueStore:
                 UPDATE jobs
                 SET status = 'failed',
                     lease_id = NULL,
-                    worker_id = NULL,
                     lease_expires_at = NULL,
                     returncode = ?,
                     stdout = ?,
@@ -276,7 +274,6 @@ class QueueStore:
                             UPDATE jobs
                             SET status = 'failed',
                                 lease_id = NULL,
-                                worker_id = NULL,
                                 lease_expires_at = NULL,
                                 error = 'lease expired',
                                 updated_at = ?,
@@ -316,22 +313,27 @@ class QueueStore:
             ).fetchall()
         return {"counts": {row["status"]: int(row["count"]) for row in rows}}
 
-    def list_jobs(self, *, experiment_id: str | None = None) -> list[dict[str, Any]]:
+    def list_jobs(
+        self,
+        *,
+        experiment_id: str | None = None,
+        job_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         self.initialize()
         with self._connect() as connection:
-            if experiment_id is None:
-                rows = connection.execute(
-                    "SELECT * FROM jobs ORDER BY created_at, id"
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE experiment_id = ?
-                    ORDER BY created_at, id
-                    """,
-                    (experiment_id,),
-                ).fetchall()
+            where = []
+            params: list[str] = []
+            if experiment_id is not None:
+                where.append("experiment_id = ?")
+                params.append(experiment_id)
+            if job_id is not None:
+                where.append("id = ?")
+                params.append(job_id)
+            where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+            rows = connection.execute(
+                f"SELECT * FROM jobs {where_sql} ORDER BY created_at, id",
+                params,
+            ).fetchall()
             job_ids = [row["id"] for row in rows]
             artifacts_by_job: dict[str, list[dict[str, Any]]] = {job_id: [] for job_id in job_ids}
             if job_ids:
@@ -357,6 +359,7 @@ class QueueStore:
             {
                 "artifacts": artifacts_by_job[row["id"]],
                 "attempts": int(row["attempts"]),
+                "completed_at": row["completed_at"],
                 "created_at": row["created_at"],
                 "error": row["error"],
                 "experiment_id": row["experiment_id"],

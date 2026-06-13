@@ -52,6 +52,8 @@ def test_queue_store_submits_leases_heartbeats_and_completes_jobs(tmp_path):
     assert len(listed) == 1
     assert listed[0]["id"] == job_id
     assert listed[0]["status"] == "completed"
+    assert listed[0]["worker_id"] == "worker-1"
+    assert listed[0]["completed_at"] == (now + timedelta(seconds=10)).isoformat()
     assert listed[0]["artifacts"] == [
         {
             "path": "out.txt",
@@ -90,7 +92,10 @@ def test_queue_store_requeues_expired_leases_until_attempts_are_exhausted(tmp_pa
         "requeued": 0,
     }
     assert store.lease_next("worker-3", lease_seconds=10, now=now + timedelta(seconds=24)) is None
-    assert store.list_jobs()[0]["status"] == "failed"
+    job = store.list_jobs()[0]
+    assert job["status"] == "failed"
+    assert job["worker_id"] == "worker-2"
+    assert job["completed_at"] == (now + timedelta(seconds=23)).isoformat()
 
 
 def test_queue_store_fail_job_records_terminal_error(tmp_path):
@@ -112,5 +117,7 @@ def test_queue_store_fail_job_records_terminal_error(tmp_path):
 
     job = store.list_jobs()[0]
     assert job["status"] == "failed"
+    assert job["worker_id"] == "worker-1"
+    assert job["completed_at"] == (now + timedelta(seconds=1)).isoformat()
     assert job["error"] == "command failed"
     assert job["returncode"] == 1

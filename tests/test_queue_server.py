@@ -108,3 +108,56 @@ def test_queue_server_requires_token_and_serves_json_queue_endpoints(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_queue_server_filters_jobs_by_id_and_experiment_id(tmp_path):
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first_job_id = store.submit_job(QueueJob(command="echo one", experiment_id="exp-a"))
+    second_job_id = store.submit_job(QueueJob(command="echo two", experiment_id="exp-b"))
+    server = create_queue_server("127.0.0.1", 0, store=store, token="secret-token")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        status, body = _request_json(
+            base_url,
+            "GET",
+            f"/api/v1/jobs?id={second_job_id}",
+            token="secret-token",
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert [job["id"] for job in body["jobs"]] == [second_job_id]
+
+        status, body = _request_json(
+            base_url,
+            "GET",
+            f"/api/v1/jobs?id={second_job_id}&experiment_id=exp-b",
+            token="secret-token",
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert [job["id"] for job in body["jobs"]] == [second_job_id]
+
+        status, body = _request_json(
+            base_url,
+            "GET",
+            f"/api/v1/jobs?id={second_job_id}&experiment_id=exp-a",
+            token="secret-token",
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert body["jobs"] == []
+
+        status, body = _request_json(
+            base_url,
+            "GET",
+            f"/api/v1/jobs?id={first_job_id}&experiment_id=exp-a",
+            token="secret-token",
+        )
+        assert status == 200
+        assert body["ok"] is True
+        assert [job["id"] for job in body["jobs"]] == [first_job_id]
+    finally:
+        server.shutdown()
+        server.server_close()

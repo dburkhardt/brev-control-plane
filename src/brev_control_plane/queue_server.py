@@ -71,10 +71,15 @@ class _QueueHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/jobs":
             experiment_values = query.get("experiment_id")
             experiment_id = experiment_values[0] if experiment_values else None
+            id_values = query.get("id")
+            job_id = id_values[0] if id_values else None
             self._write_json(
                 200,
                 {
-                    "jobs": self.server.store.list_jobs(experiment_id=experiment_id),
+                    "jobs": self.server.store.list_jobs(
+                        experiment_id=experiment_id,
+                        job_id=job_id,
+                    ),
                     "ok": True,
                 },
             )

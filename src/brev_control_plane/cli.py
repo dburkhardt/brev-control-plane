@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shlex
@@ -14,11 +15,16 @@ import time
 import uuid
 from typing import Any, TextIO
 
+from .bootstrap import render_worker_bootstrap
 from .brev import BrevClient, BrevCommandError
 from .bundles import BundleError, create_bundle_archive
 from .checks import build_check_command, parse_check_output
 from .jobs import JobSpec, JobSpecError, load_job_spec
 from .planner import CpuFilter, PlanError, plan_fleet
+from .queue_protocol import QueueJob, QueueProtocolError
+from .queue_server import create_queue_server
+from .queue_store import QueueStore
+from .worker import QueueClient, run_worker
 from .state import StateStore
 
 
@@ -51,6 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_apply.add_argument("--require-org")
     fleet_apply.add_argument("--db")
     fleet_apply.add_argument("--yes", action="store_true")
+    fleet_apply.add_argument("--max-workers", type=int)
+    fleet_apply.add_argument("--budget-usd", type=float)
+    fleet_apply.add_argument("--estimated-hourly-usd", type=float)
+    fleet_apply.add_argument("--max-hours", type=float)
     fleet_exec = fleet_subparsers.add_parser(
         "exec",
         help="Run a command on fleet instances matching a name prefix.",
@@ -78,6 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_down.add_argument("--poll-seconds", type=float, default=10.0)
     fleet_down.add_argument("--no-wait", action="store_true")
     fleet_down.add_argument("--yes", action="store_true")
+    fleet_bootstrap = fleet_subparsers.add_parser(
+        "bootstrap-workers",
+        help="Install and launch queue workers on fleet instances.",
+    )
+    fleet_bootstrap.add_argument("--name-prefix", required=True)
+    fleet_bootstrap.add_argument("--repo-url", required=True)
+    fleet_bootstrap.add_argument("--server-url", required=True)
+    fleet_bootstrap.add_argument("--token-env", default="BREV_QUEUE_TOKEN")
+    fleet_bootstrap.add_argument("--require-org")
+    fleet_bootstrap.add_argument("--host", action="store_true")
 
     inventory = subparsers.add_parser("inventory", help="Manage local inventory state.")
     inventory_subparsers = inventory.add_subparsers(
@@ -115,6 +135,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the job command through 'sg docker' for hosts whose login shell lacks Docker socket access.",
     )
 
+    queue = subparsers.add_parser("queue", help="Run and inspect the generic job queue.")
+    queue_subparsers = queue.add_subparsers(dest="queue_command", required=True)
+    queue_serve = queue_subparsers.add_parser("serve", help="Serve the queue HTTP API.")
+    queue_serve.add_argument("--db", required=True)
+    queue_serve.add_argument("--host", default="127.0.0.1")
+    queue_serve.add_argument("--port", type=int, default=8080)
+    queue_serve.add_argument("--token")
+    queue_serve.add_argument("--token-env", default="BREV_QUEUE_TOKEN")
+    queue_submit = queue_subparsers.add_parser("submit", help="Submit a shell job to a queue server.")
+    queue_submit.add_argument("--server-url", required=True)
+    queue_submit.add_argument("--token")
+    queue_submit.add_argument("--token-env", default="BREV_QUEUE_TOKEN")
+    queue_submit.add_argument("--experiment-id", required=True)
+    queue_submit.add_argument("--env", action="append", default=[])
+    queue_submit.add_argument("--output", action="append", default=[])
+    queue_submit.add_argument("--max-runtime-seconds", type=int)
+    queue_submit.add_argument("--max-attempts", type=int, default=1)
+    queue_submit.add_argument("remote_command", nargs=argparse.REMAINDER)
+    queue_status = queue_subparsers.add_parser("status", help="Read queue status.")
+    queue_status.add_argument("--server-url", required=True)
+    queue_status.add_argument("--token")
+    queue_status.add_argument("--token-env", default="BREV_QUEUE_TOKEN")
+    queue_wait = queue_subparsers.add_parser("wait", help="Wait for one queued job to finish.")
+    queue_wait.add_argument("--server-url", required=True)
+    queue_wait.add_argument("--token")
+    queue_wait.add_argument("--token-env", default="BREV_QUEUE_TOKEN")
+    queue_wait.add_argument("--job-id", required=True)
+    queue_wait.add_argument("--timeout-seconds", type=float, default=3600.0)
+    queue_wait.add_argument("--poll-seconds", type=float, default=5.0)
+
+    worker = subparsers.add_parser("worker", help="Run queue workers.")
+    worker_subparsers = worker.add_subparsers(dest="worker_command", required=True)
+    worker_run = worker_subparsers.add_parser("run", help="Lease and run shell jobs.")
+    worker_run.add_argument("--server-url", required=True)
+    worker_run.add_argument("--token")
+    worker_run.add_argument("--token-env", default="BREV_QUEUE_TOKEN")
+    worker_run.add_argument("--work-dir", required=True)
+    worker_run.add_argument("--worker-id")
+    worker_run.add_argument("--poll-seconds", type=float, default=5.0)
+    worker_run.add_argument("--lease-seconds", type=int, default=300)
+    worker_run.add_argument("--once", action="store_true")
+
     return parser
 
 
@@ -143,13 +205,32 @@ def main(
             return _fleet_check(args, stdout, client)
         if args.command == "fleet" and args.fleet_command == "down":
             return _fleet_down(args, stdout, client)
+        if args.command == "fleet" and args.fleet_command == "bootstrap-workers":
+            return _fleet_bootstrap_workers(args, stdout, client)
         if args.command == "inventory" and args.inventory_command == "refresh":
             return _inventory_refresh(args, stdout, client)
         if args.command == "jobs" and args.jobs_command == "validate":
             return _jobs_validate(args, stdout)
         if args.command == "jobs" and args.jobs_command == "run":
             return _jobs_run(args, stdout, client)
-    except (BrevCommandError, BundleError, JobSpecError, PlanError) as exc:
+        if args.command == "queue" and args.queue_command == "serve":
+            return _queue_serve(args, stdout)
+        if args.command == "queue" and args.queue_command == "submit":
+            return _queue_submit(args, stdout)
+        if args.command == "queue" and args.queue_command == "status":
+            return _queue_status(args, stdout)
+        if args.command == "queue" and args.queue_command == "wait":
+            return _queue_wait(args, stdout)
+        if args.command == "worker" and args.worker_command == "run":
+            return _worker_run(args)
+    except (
+        BrevCommandError,
+        BundleError,
+        JobSpecError,
+        PlanError,
+        QueueProtocolError,
+        RuntimeError,
+    ) as exc:
         _write_json(stderr, {"error": str(exc)})
         return 2
 
@@ -200,6 +281,7 @@ def _fleet_apply(
         raise PlanError("fleet apply creates instances and requires --yes")
     if args.timeout_seconds <= 0:
         raise PlanError("timeout_seconds must be positive")
+    _check_fleet_apply_budget(args)
 
     plan = plan_fleet(
         workers=args.workers,
@@ -390,6 +472,28 @@ def _fleet_down(
     return 2 if delete_failed or wait_timed_out else 0
 
 
+def _fleet_bootstrap_workers(
+    args: argparse.Namespace,
+    stdout: TextIO,
+    client: BrevClient | None,
+) -> int:
+    brev_client = client or BrevClient()
+    _require_active_org(brev_client, args.require_org)
+    names = _matching_instance_names(brev_client, args.name_prefix)
+    results: list[dict[str, Any]] = []
+    for name in names:
+        script = render_worker_bootstrap(
+            repo_url=args.repo_url,
+            server_url=args.server_url,
+            token_env_name=args.token_env,
+            worker_name=name,
+        )
+        output = brev_client.exec_instance(name, script, host=args.host)
+        results.append({"instance": name, "ok": True, "output": output})
+    _write_json(stdout, {"instances": names, "results": results})
+    return 0
+
+
 def _inventory_refresh(
     args: argparse.Namespace,
     stdout: TextIO,
@@ -541,6 +645,80 @@ def _jobs_run(
 
     _write_json(stdout, {"instances": names, "results": results})
     return 0 if all(result["ok"] for result in results) else 2
+
+
+def _queue_serve(args: argparse.Namespace, stdout: TextIO) -> int:
+    token = _queue_token(args)
+    store = QueueStore(Path(args.db))
+    server = create_queue_server(args.host, args.port, store=store, token=token)
+    _write_json(
+        stdout,
+        {
+            "ok": True,
+            "server": {
+                "host": server.server_address[0],
+                "port": server.server_address[1],
+            },
+        },
+    )
+    server.serve_forever()
+    return 0
+
+
+def _queue_submit(args: argparse.Namespace, stdout: TextIO) -> int:
+    job = QueueJob(
+        command=_command_from_remainder(args.remote_command),
+        env=_env_from_args(args.env),
+        experiment_id=args.experiment_id,
+        max_attempts=args.max_attempts,
+        max_runtime_seconds=args.max_runtime_seconds,
+        output_paths=list(args.output),
+    )
+    payload = QueueClient(server_url=args.server_url, token=_queue_token(args)).submit(job)
+    _write_json(stdout, payload)
+    return 0
+
+
+def _queue_status(args: argparse.Namespace, stdout: TextIO) -> int:
+    payload = QueueClient(server_url=args.server_url, token=_queue_token(args)).status()
+    _write_json(stdout, payload)
+    return 0
+
+
+def _queue_wait(args: argparse.Namespace, stdout: TextIO) -> int:
+    if args.timeout_seconds < 0:
+        raise PlanError("timeout_seconds must be non-negative")
+    if args.poll_seconds < 0:
+        raise PlanError("poll_seconds must be non-negative")
+    client = QueueClient(server_url=args.server_url, token=_queue_token(args))
+    deadline = time.monotonic() + args.timeout_seconds
+    while True:
+        payload = client.jobs()
+        matches = [job for job in payload["jobs"] if job["id"] == args.job_id]
+        if not matches:
+            raise PlanError(f"job not found: {args.job_id}")
+        job = matches[0]
+        if job["status"] in {"completed", "failed"}:
+            _write_json(stdout, {"job": job, "ok": True})
+            return 0 if job["status"] == "completed" else 2
+        if time.monotonic() >= deadline:
+            _write_json(stdout, {"error": "timeout", "job": job, "ok": False})
+            return 1
+        if args.poll_seconds > 0:
+            time.sleep(args.poll_seconds)
+
+
+def _worker_run(args: argparse.Namespace) -> int:
+    run_worker(
+        server_url=args.server_url,
+        token=_queue_token(args),
+        work_dir=args.work_dir,
+        worker_id=args.worker_id,
+        poll_seconds=args.poll_seconds,
+        once=args.once,
+        lease_seconds=args.lease_seconds,
+    )
+    return 0
 
 
 def _copy_to_instance_with_retries(
@@ -834,6 +1012,57 @@ def _require_active_org(client: BrevClient, required_org: str | None) -> None:
         raise PlanError(
             f"active Brev org is {active_org!r}; expected {required_org!r}"
         )
+
+
+def _check_fleet_apply_budget(args: argparse.Namespace) -> None:
+    if args.max_workers is not None:
+        if args.max_workers <= 0:
+            raise PlanError("max-workers must be positive")
+        if args.workers > args.max_workers:
+            raise PlanError(
+                f"requested workers {args.workers} exceeds max-workers {args.max_workers}"
+            )
+    budget_args = [args.budget_usd, args.estimated_hourly_usd, args.max_hours]
+    if any(value is not None for value in budget_args):
+        if any(value is None for value in budget_args):
+            raise PlanError(
+                "budget guard requires --budget-usd, --estimated-hourly-usd, and --max-hours"
+            )
+        if args.budget_usd < 0:
+            raise PlanError("budget-usd must be non-negative")
+        if args.estimated_hourly_usd < 0:
+            raise PlanError("estimated-hourly-usd must be non-negative")
+        if args.max_hours < 0:
+            raise PlanError("max-hours must be non-negative")
+        estimated = args.workers * args.estimated_hourly_usd * args.max_hours
+        if estimated > args.budget_usd:
+            raise PlanError(
+                "estimated fleet cost "
+                f"{estimated:.2f} exceeds budget-usd {args.budget_usd:.2f}"
+            )
+
+
+def _queue_token(args: argparse.Namespace) -> str:
+    token = getattr(args, "token", None)
+    if token:
+        return token
+    token_env = getattr(args, "token_env", "BREV_QUEUE_TOKEN")
+    env_token = os.environ.get(token_env)
+    if env_token:
+        return env_token
+    raise PlanError(f"queue token must be provided with --token or ${token_env}")
+
+
+def _env_from_args(items: list[str]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise PlanError("queue submit --env values must be KEY=VALUE")
+        key, value = item.split("=", 1)
+        if not key:
+            raise PlanError("queue submit --env keys must be non-empty")
+        env[key] = value
+    return env
 
 
 def _state_store(path: str | None) -> StateStore | None:

@@ -8,6 +8,8 @@ from pathlib import Path
 
 from brev_control_plane.brev import BrevCommandError
 from brev_control_plane.cli import main
+from brev_control_plane.queue_server import create_queue_server
+from brev_control_plane.queue_store import QueueStore
 from brev_control_plane.state import StateStore
 
 
@@ -278,6 +280,68 @@ def test_cli_fleet_apply_records_created_events(tmp_path):
             },
         )
     ]
+
+
+def test_cli_fleet_apply_rejects_before_create_when_worker_budget_is_exceeded():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    client = FakeBrevClient()
+
+    code = main(
+        [
+            "fleet",
+            "apply",
+            "--workers",
+            "3",
+            "--type",
+            "n2d-highcpu-2",
+            "--name-prefix",
+            "smoke",
+            "--max-workers",
+            "2",
+            "--yes",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+        client=client,
+    )
+
+    assert code == 2
+    assert client.created == []
+    assert "max-workers" in json.loads(stderr.getvalue())["error"]
+
+
+def test_cli_fleet_apply_rejects_before_create_when_estimated_budget_is_exceeded():
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    client = FakeBrevClient()
+
+    code = main(
+        [
+            "fleet",
+            "apply",
+            "--workers",
+            "3",
+            "--type",
+            "n2d-highcpu-2",
+            "--name-prefix",
+            "smoke",
+            "--budget-usd",
+            "50",
+            "--estimated-hourly-usd",
+            "2",
+            "--max-hours",
+            "10",
+            "--yes",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+        client=client,
+    )
+
+    assert code == 2
+    assert client.created == []
+    assert "estimated fleet cost" in json.loads(stderr.getvalue())["error"]
 
 
 def test_cli_fleet_exec_runs_command_on_matching_instances():
@@ -1551,3 +1615,93 @@ def test_cli_jobs_run_limits_parallel_instance_execution(tmp_path):
         "smoke-002",
         "smoke-003",
     ]
+
+
+def test_cli_queue_submit_and_status_use_http_queue_server(tmp_path):
+    server_store = QueueStore(tmp_path / "queue.sqlite3")
+    server = create_queue_server(
+        "127.0.0.1",
+        0,
+        store=server_store,
+        token="secret-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    server_url = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        submit_stdout = io.StringIO()
+        code = main(
+            [
+                "queue",
+                "submit",
+                "--server-url",
+                server_url,
+                "--token",
+                "secret-token",
+                "--experiment-id",
+                "exp-a",
+                "--output",
+                "out.txt",
+                "--",
+                "echo",
+                "hi",
+            ],
+            stdout=submit_stdout,
+        )
+
+        assert code == 0
+        submitted = json.loads(submit_stdout.getvalue())
+        assert submitted["ok"] is True
+        assert submitted["job_id"]
+
+        status_stdout = io.StringIO()
+        code = main(
+            [
+                "queue",
+                "status",
+                "--server-url",
+                server_url,
+                "--token",
+                "secret-token",
+            ],
+            stdout=status_stdout,
+        )
+
+        assert code == 0
+        status = json.loads(status_stdout.getvalue())
+        assert status["ok"] is True
+        assert status["status"]["counts"] == {"queued": 1}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cli_fleet_bootstrap_workers_uses_token_env_name_not_secret_value():
+    stdout = io.StringIO()
+    client = FakeBrevClient()
+    client.instances = [{"id": "inst-1", "name": "smoke-001", "status": "RUNNING"}]
+
+    code = main(
+        [
+            "fleet",
+            "bootstrap-workers",
+            "--name-prefix",
+            "smoke",
+            "--repo-url",
+            "https://example.invalid/org/repo.git",
+            "--server-url",
+            "https://queue.example.invalid",
+            "--token-env",
+            "QUEUE_TOKEN",
+        ],
+        stdout=stdout,
+        client=client,
+    )
+
+    assert code == 0
+    assert len(client.exec_calls) == 1
+    command = client.exec_calls[0]["command"]
+    assert "--token-env QUEUE_TOKEN" in command
+    assert "secret-token" not in command
+    payload = json.loads(stdout.getvalue())
+    assert payload["instances"] == ["smoke-001"]

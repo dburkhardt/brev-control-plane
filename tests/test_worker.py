@@ -55,6 +55,50 @@ def test_worker_leases_shell_job_hashes_outputs_and_reports_complete(tmp_path):
         server.server_close()
 
 
+def test_worker_materializes_input_files_before_running_command(tmp_path):
+    server, store, base_url = _server(tmp_path)
+    try:
+        store.submit_job(
+            QueueJob(
+                command=(
+                    f"{sys.executable} -c "
+                    "\"from pathlib import Path; "
+                    "payload=Path('payload/job.json').read_text(); "
+                    "Path('out.txt').write_text(payload)\""
+                ),
+                experiment_id="exp-a",
+                input_files=[
+                    {
+                        "path": "payload/job.json",
+                        "content_b64": "eyJvayI6IHRydWV9",
+                        "mode": "0644",
+                    }
+                ],
+                output_paths=["out.txt"],
+            )
+        )
+
+        assert run_worker_once(
+            server_url=base_url,
+            token="secret-token",
+            work_dir=tmp_path / "work",
+            worker_id="worker-1",
+        ) is True
+
+        job = store.list_jobs()[0]
+        assert job["status"] == "completed"
+        assert job["artifacts"] == [
+            {
+                "path": "out.txt",
+                "sha256": hashlib.sha256(b'{"ok": true}').hexdigest(),
+                "size_bytes": len(b'{"ok": true}'),
+            }
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_worker_reports_failure_when_subprocess_times_out(tmp_path):
     server, store, base_url = _server(tmp_path)
     try:

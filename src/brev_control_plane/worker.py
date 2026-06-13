@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 from pathlib import Path
@@ -183,6 +184,15 @@ def _run_job(job: QueueJob, job_dir: Path) -> dict[str, Any]:
     env = dict(os.environ)
     env.update(job.env)
     try:
+        _materialize_input_files(job, job_dir)
+    except RuntimeError as exc:
+        return {
+            "error": str(exc),
+            "ok": False,
+            "stderr": "",
+            "stdout": "",
+        }
+    try:
         completed = subprocess.run(
             job.command,
             cwd=job_dir,
@@ -241,6 +251,19 @@ def _hash_output_path(job_dir: Path, output_path: str) -> list[dict[str, Any]]:
     if not target.is_file():
         raise RuntimeError(f"requested output path was not produced: {output_path}")
     return [_hash_file(job_dir, target)]
+
+
+def _materialize_input_files(job: QueueJob, job_dir: Path) -> None:
+    for input_file in job.input_files:
+        target = job_dir / input_file["path"]
+        try:
+            target.relative_to(job_dir)
+        except ValueError as exc:
+            raise RuntimeError(f"input path escapes job directory: {input_file['path']}") from exc
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = base64.b64decode(input_file["content_b64"].encode("ascii"), validate=True)
+        target.write_bytes(data)
+        target.chmod(int(input_file.get("mode", "0644"), 8))
 
 
 def _hash_file(job_dir: Path, path: Path) -> dict[str, Any]:

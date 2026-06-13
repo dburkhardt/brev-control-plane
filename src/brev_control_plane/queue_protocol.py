@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass, field
 from datetime import datetime
 import hmac
@@ -18,6 +20,7 @@ class QueueJob:
     command: str
     experiment_id: str
     env: dict[str, str] = field(default_factory=dict)
+    input_files: list[dict[str, str]] = field(default_factory=list)
     output_paths: list[str] = field(default_factory=list)
     max_runtime_seconds: int | None = None
     max_attempts: int = 1
@@ -27,6 +30,7 @@ class QueueJob:
         object.__setattr__(self, "command", validated.command)
         object.__setattr__(self, "experiment_id", validated.experiment_id)
         object.__setattr__(self, "env", validated.env)
+        object.__setattr__(self, "input_files", validated.input_files)
         object.__setattr__(self, "output_paths", validated.output_paths)
         object.__setattr__(self, "max_runtime_seconds", validated.max_runtime_seconds)
         object.__setattr__(self, "max_attempts", validated.max_attempts)
@@ -36,6 +40,7 @@ class QueueJob:
             "command": self.command,
             "env": dict(self.env),
             "experiment_id": self.experiment_id,
+            "input_files": [dict(item) for item in self.input_files],
             "max_attempts": self.max_attempts,
             "max_runtime_seconds": self.max_runtime_seconds,
             "output_paths": list(self.output_paths),
@@ -78,6 +83,11 @@ class QueueJob:
             if not isinstance(value, str):
                 raise QueueProtocolError("env values must be strings")
 
+        input_files = payload.get("input_files", [])
+        if not isinstance(input_files, list):
+            raise QueueProtocolError("input_files must be an array")
+        normalized_input_files = [_validate_input_file(item) for item in input_files]
+
         output_paths = payload.get("output_paths", [])
         if not isinstance(output_paths, list):
             raise QueueProtocolError("output_paths must be an array")
@@ -101,6 +111,7 @@ class QueueJob:
             command=command,
             experiment_id=experiment_id,
             env=dict(env),
+            input_files=normalized_input_files,
             output_paths=list(output_paths),
             max_runtime_seconds=max_runtime_seconds,
             max_attempts=max_attempts,
@@ -113,6 +124,7 @@ class QueueJob:
         command: str,
         experiment_id: str,
         env: dict[str, str],
+        input_files: list[dict[str, str]],
         output_paths: list[str],
         max_runtime_seconds: int | None,
         max_attempts: int,
@@ -121,6 +133,7 @@ class QueueJob:
         object.__setattr__(job, "command", command)
         object.__setattr__(job, "experiment_id", experiment_id)
         object.__setattr__(job, "env", env)
+        object.__setattr__(job, "input_files", input_files)
         object.__setattr__(job, "output_paths", output_paths)
         object.__setattr__(job, "max_runtime_seconds", max_runtime_seconds)
         object.__setattr__(job, "max_attempts", max_attempts)
@@ -167,6 +180,35 @@ def validate_queue_token(expected: str, supplied: str | None) -> bool:
     if supplied is None:
         supplied = ""
     return hmac.compare_digest(expected, supplied)
+
+
+def _validate_input_file(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise QueueProtocolError("input_files entries must be objects")
+    path = value.get("path")
+    if not isinstance(path, str):
+        raise QueueProtocolError("input_files path must be a string")
+    try:
+        _validate_artifact_path(path)
+    except JobSpecError as exc:
+        raise QueueProtocolError(f"input_files: {exc}") from exc
+    content_b64 = value.get("content_b64")
+    if not isinstance(content_b64, str):
+        raise QueueProtocolError("input_files content_b64 must be a string")
+    try:
+        base64.b64decode(content_b64.encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError) as exc:
+        raise QueueProtocolError("input_files content_b64 must be valid base64") from exc
+    mode = value.get("mode", "0644")
+    if not isinstance(mode, str):
+        raise QueueProtocolError("input_files mode must be a string")
+    try:
+        parsed = int(mode, 8)
+    except ValueError as exc:
+        raise QueueProtocolError("input_files mode must be octal") from exc
+    if parsed < 0 or parsed > 0o777:
+        raise QueueProtocolError("input_files mode must be between 0000 and 0777")
+    return {"path": path, "content_b64": content_b64, "mode": mode}
 
 
 def _is_positive_int(value: Any) -> bool:

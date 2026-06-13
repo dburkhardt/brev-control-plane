@@ -19,10 +19,30 @@ def test_queue_job_round_trips_json_with_safe_defaults():
         "command": "echo hello",
         "env": {},
         "experiment_id": "exp-a",
+        "input_files": [],
         "max_attempts": 1,
         "max_runtime_seconds": None,
         "output_paths": [],
     }
+
+
+def test_queue_job_round_trips_input_files():
+    job = QueueJob(
+        command="python3 run.py",
+        experiment_id="exp-a",
+        input_files=[
+            {
+                "path": "payload/job.json",
+                "content_b64": "eyJvayI6IHRydWV9",
+                "mode": "0644",
+            }
+        ],
+    )
+
+    loaded = QueueJob.from_json(job.to_json())
+
+    assert loaded == job
+    assert loaded.input_files[0]["path"] == "payload/job.json"
 
 
 def test_queue_job_validates_relative_output_paths_like_artifacts():
@@ -33,6 +53,19 @@ def test_queue_job_validates_relative_output_paths_like_artifacts():
     )
 
     assert QueueJob.from_dict(job.to_dict()).output_paths == ["reports/result.json"]
+
+
+@pytest.mark.parametrize(
+    "input_path",
+    ["", ".", "..", "../secret.txt", "/tmp/in.txt", r"C:\tmp\in.txt"],
+)
+def test_queue_job_rejects_unsafe_input_paths(input_path):
+    with pytest.raises(QueueProtocolError, match="input_files"):
+        QueueJob(
+            command="echo hi",
+            experiment_id="exp-a",
+            input_files=[{"path": input_path, "content_b64": "AA=="}],
+        )
 
 
 @pytest.mark.parametrize(
